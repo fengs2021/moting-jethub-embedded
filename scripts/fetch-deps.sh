@@ -15,10 +15,14 @@
 #   sdk/build-tools/34.0.0/    d8 / zipalign / apksigner / aapt2
 #   sdk/platforms/android-34/  平台库（android.jar 的原始出处）
 #
+# GitHub 在国内是间歇性可达的（同一个 URL 这次通、下次超时），所以 GitHub 的
+# 资源按「直连 → 一组加速镜像」的顺序依次尝试，谁先成功用谁。所有来源都过
+# sha256 校验，镜像即使被投毒也进不来。
+#
 # 环境变量：
 #   JETHUB_TOOLCHAIN   工具链目录（默认 ./toolchain）
 #   JETHUB_SDK         SDK 目录（默认 ./sdk）
-#   JETHUB_GH_MIRROR   GitHub 加速前缀，如 https://ghfast.top/（默认空=直连）
+#   JETHUB_GH_MIRRORS  GitHub 加速前缀列表（空格分隔，默认见下）
 #   JETHUB_CURL_OPTS   追加给 curl 的参数（默认 --retry 3）
 #
 # 用法：
@@ -32,7 +36,7 @@ cd "$ROOT"
 
 TOOLCHAIN="${JETHUB_TOOLCHAIN:-$ROOT/toolchain}"
 SDK="${JETHUB_SDK:-$ROOT/sdk}"
-GH_MIRROR="${JETHUB_GH_MIRROR:-}"
+GH_MIRRORS="${JETHUB_GH_MIRRORS:-https://gh-proxy.com/ https://ghproxy.net/ https://ghfast.top/}"
 CURL_OPTS="${JETHUB_CURL_OPTS:---retry 3 --connect-timeout 20}"
 BT_DIR="$SDK/build-tools/34.0.0"
 
@@ -44,31 +48,42 @@ mkdir -p "$TOOLCHAIN" "$SDK/build-tools" "$SDK/platforms"
 
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 
-# GitHub 走可选镜像；其余源直连。
-url_for() {
+# GitHub 资源生成候选 URL 列表：直连优先，然后是各加速镜像。
+# 非 GitHub 源只有一个候选。
+urls_for() {
   case "$1" in
-    https://github.com/*) printf '%s%s' "$GH_MIRROR" "$1" ;;
-    *)                    printf '%s' "$1" ;;
+    https://github.com/*)
+      printf '%s\n' "$1"
+      local m
+      for m in $GH_MIRRORS; do printf '%s%s\n' "$m" "$1"; done
+      ;;
+    *) printf '%s\n' "$1" ;;
   esac
 }
 
 # fetch <url> <目标路径> <期望 sha256>
+# GitHub 资源逐个候选尝试；只要有一个能下完且哈希对就算成功。
 fetch() {
-  local url="$1" dest="$2" want="$3" got
+  local url="$1" dest="$2" want="$3" got cand ok=0
   if [ -f "$dest" ] && [ "$(sha256_of "$dest")" = "$want" ]; then
     echo "  ✓ $(basename "$dest")  已就绪"
     return 0
   fi
   echo "  ↓ $(basename "$dest")"
-  # shellcheck disable=SC2086
-  curl -fL $CURL_OPTS --max-time 1800 -o "$dest.part" "$(url_for "$url")" \
-    || { rm -f "$dest.part"; echo "  ✗ 下载失败：$url" >&2; return 1; }
-  got="$(sha256_of "$dest.part")"
-  if [ "$got" != "$want" ]; then
+  while IFS= read -r cand; do
+    # shellcheck disable=SC2086
+    if curl -fL $CURL_OPTS --max-time 600 -o "$dest.part" "$cand" 2>/dev/null; then
+      got="$(sha256_of "$dest.part")"
+      if [ "$got" = "$want" ]; then ok=1; break; fi
+      echo "      候选哈希不符，换下一个来源：${cand%%/download*}" >&2
+    fi
     rm -f "$dest.part"
-    echo "  ✗ $(basename "$dest") 校验失败" >&2
-    echo "      期望 $want" >&2
-    echo "      实际 $got" >&2
+  done < <(urls_for "$url")
+
+  if [ "$ok" != 1 ]; then
+    rm -f "$dest.part"
+    echo "  ✗ 下载失败：$url" >&2
+    echo "      所有来源都不可用。可设 JETHUB_GH_MIRRORS 指定镜像，或手动放置该文件后重跑。" >&2
     return 1
   fi
   mv "$dest.part" "$dest"
@@ -76,17 +91,27 @@ fetch() {
 }
 
 echo "== 1/3 工具链 jar → $TOOLCHAIN =="
-# 每行：文件名|URL|sha256。版本刻意钉死，换版本要同步更新这里的哈希。
-while IFS='|' read -r name url sha; do
+# 每行：文件名|URL|sha256|必需性。版本刻意钉死，换版本要同步更新这里的哈希。
+# smali.jar 标 optional：只有轻量路线 scripts/build.sh 用它，全量路线不需要，
+# 所以它下不下来都不该挡住出包。
+fail=0
+while IFS='|' read -r name url sha need; do
   [ -n "$name" ] || continue
-  fetch "$url" "$TOOLCHAIN/$name" "$sha"
+  if ! fetch "$url" "$TOOLCHAIN/$name" "$sha"; then
+    if [ "$need" = "optional" ]; then
+      echo "      （$name 可选，跳过）" >&2
+    else
+      fail=1
+    fi
+  fi
 done <<'MANIFEST'
-apktool.jar|https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar|7956eb04194300ce0d0a84ad18771eebc94b89fb8d1ddcce8ea4c056818646f4
-baksmali.jar|https://github.com/baksmali/smali/releases/download/v2.5.2/baksmali-2.5.2.jar|d3116248cce4f82ec5a31eb7f95ee75daff42ddf6eed0ab573973dc53fbad2e5
-smali.jar|https://github.com/baksmali/smali/releases/download/v2.5.2/smali-2.5.2.jar|9544299578b16f771d8aa8eaefe0d3718ca03478c16f3c356f2fcf1366bfb116
-json.jar|https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar|3cf6cd6892e32e2b4c1c39e0f52f5248a2f5b37646fdfbb79a66b46b618414ed
-r8.jar|https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.2.33/r8-8.2.33.jar|80c39a28bb66b64efc232d68ae554d59fe3838808738b4fe584884691cb1e5a3
+apktool.jar|https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar|7956eb04194300ce0d0a84ad18771eebc94b89fb8d1ddcce8ea4c056818646f4|required
+baksmali.jar|https://github.com/baksmali/smali/releases/download/v2.5.2/baksmali-2.5.2.jar|d3116248cce4f82ec5a31eb7f95ee75daff42ddf6eed0ab573973dc53fbad2e5|required
+smali.jar|https://github.com/baksmali/smali/releases/download/v2.5.2/smali-2.5.2.jar|9544299578b16f771d8aa8eaefe0d3718ca03478c16f3c356f2fcf1366bfb116|optional
+json.jar|https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar|3cf6cd6892e32e2b4c1c39e0f52f5248a2f5b37646fdfbb79a66b46b618414ed|required
+r8.jar|https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.2.33/r8-8.2.33.jar|80c39a28bb66b64efc232d68ae554d59fe3838808738b4fe584884691cb1e5a3|required
 MANIFEST
+[ "$fail" = 0 ] || { echo "必需依赖缺失，无法继续。" >&2; exit 1; }
 
 echo
 echo "== 2/3 Android build-tools 34.0.0 → $BT_DIR =="

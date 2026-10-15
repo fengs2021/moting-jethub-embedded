@@ -48,21 +48,35 @@ mkdir -p "$TOOLCHAIN" "$SDK/build-tools" "$SDK/platforms"
 
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 
-# GitHub 资源生成候选 URL 列表：直连优先，然后是各加速镜像。
-# 非 GitHub 源只有一个候选。
+# 各源的中文镜像改写规则。已实测这些镜像返回的文件与官方 sha256 逐字节一致。
+mirror_variants() {
+  case "$1" in
+    https://dl.google.com/dl/android/maven2/*)
+      printf '%s\n' "${1/dl.google.com\/dl\/android\/maven2/maven.aliyun.com\/repository\/google}"
+      ;;
+    https://dl.google.com/android/repository/*)
+      printf '%s\n' "${1/dl.google.com\/android\/repository/mirrors.cloud.tencent.com\/AndroidSDK}"
+      ;;
+    https://repo1.maven.org/maven2/*)
+      printf '%s\n' "${1/repo1.maven.org\/maven2/maven.aliyun.com\/repository\/public}"
+      ;;
+  esac
+}
+
+# 为一个资源生成候选 URL 列表：直连 → 各镜像。谁先下完且哈希对就用谁。
 urls_for() {
+  local m
+  printf '%s\n' "$1"
+  mirror_variants "$1"
   case "$1" in
     https://github.com/*)
-      printf '%s\n' "$1"
-      local m
       for m in $GH_MIRRORS; do printf '%s%s\n' "$m" "$1"; done
       ;;
-    *) printf '%s\n' "$1" ;;
   esac
 }
 
 # fetch <url> <目标路径> <期望 sha256>
-# GitHub 资源逐个候选尝试；只要有一个能下完且哈希对就算成功。
+# 逐个候选尝试；只要有一个能下完且哈希对就算成功。
 fetch() {
   local url="$1" dest="$2" want="$3" got cand ok=0
   if [ -f "$dest" ] && [ "$(sha256_of "$dest")" = "$want" ]; then
@@ -75,7 +89,7 @@ fetch() {
     if curl -fL $CURL_OPTS --max-time 600 -o "$dest.part" "$cand" 2>/dev/null; then
       got="$(sha256_of "$dest.part")"
       if [ "$got" = "$want" ]; then ok=1; break; fi
-      echo "      候选哈希不符，换下一个来源：${cand%%/download*}" >&2
+      echo "      候选哈希不符，换下一个来源：$(echo "$cand" | cut -d/ -f3)" >&2
     fi
     rm -f "$dest.part"
   done < <(urls_for "$url")

@@ -19,7 +19,7 @@
 # 依赖（toolchain/ 与 sdk/）由 scripts/fetch-deps.sh 自动拉取并校验哈希。
 #
 # 环境变量（括号内为默认值）：
-#   JETHUB_UPSTREAM_APK  原始墨听 APK（必填；仓库不含，需自备）
+#   JETHUB_UPSTREAM_APK  原始墨听 APK（默认自动下载到 ./upstream/；想用别的版本就指过来）
 #   ANDROID_BUILD_TOOLS  build-tools 目录（默认 ./sdk/build-tools/34.0.0）
 #   JETHUB_TOOLCHAIN     toolchain 目录（默认 ./toolchain）
 #   JETHUB_DECODED       apktool 解包出来的反编译树（默认 ./full-decoded）
@@ -33,7 +33,9 @@
 #   JETHUB_SKIP_DEPS=1   跳过自动拉依赖（依赖已就绪时省时间）
 #
 # 用法：
-#   JETHUB_UPSTREAM_APK=/path/to/墨听.apk bash scripts/build-full.sh
+#   bash scripts/build-full.sh
+# 默认会自己把工具链与原始墨听 APK 都拉下来，所以裸跑就行。
+# 想指定上游版本：JETHUB_UPSTREAM_APK=/path/to/墨听.apk bash scripts/build-full.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -44,11 +46,17 @@ SDK="${JETHUB_SDK:-$ROOT/sdk}"
 DECODED="${JETHUB_DECODED:-$ROOT/full-decoded}"
 BAKSMALI="${JETHUB_SMALI_TOOL:-$TOOLCHAIN/baksmali.jar}"
 OUT="${JETHUB_OUT:-墨听-4.0.20-jethub内置版.apk}"
-UPSTREAM="${JETHUB_UPSTREAM_APK:-}"
 
 # ---------------------------------------------------------------- 依赖自举
 . "$ROOT/scripts/lib-deps.sh"
-ensure_deps "android-34.jar json.jar r8.jar baksmali.jar apktool.jar"
+# 第二个参数 = 1：把「原始墨听 APK」也算进依赖，缺了就自动下载。
+# 但已经有反编译树（下面 [3/9] 会跳过解包）时就不需要它了，别白下一遍。
+if [ -d "$DECODED" ] && [ -z "${JETHUB_REDECODE:-}" ]; then
+  ensure_deps "android-34.jar json.jar r8.jar baksmali.jar apktool.jar"
+else
+  ensure_deps "android-34.jar json.jar r8.jar baksmali.jar apktool.jar" 1
+fi
+UPSTREAM="${JETHUB_UPSTREAM_APK:-}"
 
 mkdir -p build apk
 

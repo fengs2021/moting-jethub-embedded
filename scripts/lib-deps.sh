@@ -44,10 +44,28 @@ jethub_force_utf8() {
 }
 jethub_force_utf8
 
-# ensure_deps "android-34.jar r8.jar ..."
+# jethub_upstream_apk
+# 解析「要改造的原始墨听 APK」的路径，按优先级：
+#   1. 调用者显式给的 JETHUB_UPSTREAM_APK
+#   2. 之前自举下载到 upstream/ 的那份
+# 找不到就输出空串。
+jethub_upstream_apk() {
+  local p
+  if [ -n "${JETHUB_UPSTREAM_APK:-}" ]; then
+    printf '%s\n' "$JETHUB_UPSTREAM_APK"
+    return 0
+  fi
+  for p in "$JETHUB_ROOT"/upstream/*.apk; do
+    [ -f "$p" ] && { printf '%s\n' "$p"; return 0; }
+  done
+  return 0
+}
+
+# ensure_deps "<jar 名单>" [want_upstream]
 # 缺失就调 fetch-deps.sh 自举；自举后仍缺则报错退出。
+# want_upstream=1 时把「原始墨听 APK」也算进依赖。
 ensure_deps() {
-  local want="$1" need=0 f
+  local want="$1" want_upstream="${2:-}" need=0 f
 
   for f in $want; do
     [ -f "$TOOLCHAIN/$f" ] || need=1
@@ -58,9 +76,12 @@ ensure_deps() {
   if [ -z "${ANDROID_BUILD_TOOLS:-}" ] && [ ! -x "$SDK/build-tools/$BT_VERSION/zipalign" ]; then
     need=1
   fi
+  if [ -n "$want_upstream" ] && [ -z "$(jethub_upstream_apk)" ]; then
+    need=1
+  fi
 
   if [ "$need" = 1 ] && [ -z "${JETHUB_SKIP_DEPS:-}" ]; then
-    echo "[0] 拉取并校验外部依赖（工具链 + Android SDK 片段）"
+    echo "[0] 拉取并校验外部依赖（工具链 + Android SDK 片段 + 原始墨听 APK）"
     bash "$JETHUB_ROOT/scripts/fetch-deps.sh"
   fi
 
@@ -83,5 +104,21 @@ ensure_deps() {
     echo "缺少工具链构件：$missing" >&2
     echo "  跑 bash scripts/fetch-deps.sh（GitHub 不通时设 JETHUB_GH_MIRRORS）。" >&2
     exit 1
+  fi
+
+  if [ -n "$want_upstream" ]; then
+    local up
+    up="$(jethub_upstream_apk)"
+    if [ -z "$up" ]; then
+      cat >&2 <<'EOF'
+缺少原始墨听 APK。
+  跑 bash scripts/fetch-deps.sh 会自动下载，或者自己从
+  https://github.com/jwoo1982217-eng/MoTing-Releases/releases 下载后：
+      JETHUB_UPSTREAM_APK=/path/to/墨听.apk bash scripts/build-full.sh
+EOF
+      exit 1
+    fi
+    JETHUB_UPSTREAM_APK="$up"
+    export JETHUB_UPSTREAM_APK
   fi
 }

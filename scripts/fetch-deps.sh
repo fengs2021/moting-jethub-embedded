@@ -37,7 +37,22 @@ cd "$ROOT"
 TOOLCHAIN="${JETHUB_TOOLCHAIN:-$ROOT/toolchain}"
 SDK="${JETHUB_SDK:-$ROOT/sdk}"
 GH_MIRRORS="${JETHUB_GH_MIRRORS:-https://gh-proxy.com/ https://ghproxy.net/ https://ghfast.top/}"
-CURL_OPTS="${JETHUB_CURL_OPTS:---retry 3 --connect-timeout 20}"
+CURL_OPTS="${JETHUB_CURL_OPTS:---retry 3 --retry-delay 2 --connect-timeout 20}"
+# 「慢到没有希望」才放弃，而不是「超过固定时长」就放弃。
+# 原来用的是 --max-time 600，那是个陷阱：上游 APK 有 68 MB，链路只有 42 KB/s 时
+# 需要 27 分钟，600 秒一到 curl 就被杀，而且没有断点续传，下一轮从 0 重来 ——
+# 在这种链路上永远下不完。
+# 现在两层保护：
+#   1. --speed-limit/--speed-time：连续 60 秒低于 1 KB/s 才判定该源死了；
+#   2. 每个源只给 SRC_BUDGET 秒，超时就换下一个候选，靠 -C - 接着下。
+# 第 2 条是为了让慢源及时让位给快源：实测同一条链路上直连 42 KB/s、
+# gh-proxy 155 KB/s，只按速率判定的话慢源永远「没死」，会一直霸着不放。
+SLOW_OPTS="${JETHUB_SLOW_OPTS:---speed-limit 1024 --speed-time 60}"
+SRC_BUDGET="${JETHUB_SRC_BUDGET:-300}"
+# 所有候选轮完算一轮；每轮都能累积进度，所以允许重来几轮。
+# 真正的终止条件是「一整轮下来一个字节都没长」，所以这里给宽一点没关系：
+# 假设所有源都只有 40 KB/s，68 MB 的上游包需要 4~5 轮才够。
+MAX_PASSES="${JETHUB_MAX_PASSES:-10}"
 BT_DIR="$SDK/build-tools/34.0.0"
 
 command -v curl >/dev/null || { echo "需要 curl" >&2; exit 1; }
@@ -77,6 +92,13 @@ urls_for() {
 
 # fetch <url> <目标路径> <期望 sha256>
 # 逐个候选尝试；只要有一个能下完且哈希对就算成功。
+#
+# 断点续传的关键：$dest.part 只增不减。
+# 天真写法是让每个候选都直接写 $dest.part 并带 -C -，但那是错的：如果某个源不认
+# Range（回 200 而不是 206），curl 会从偏移 0 重写，把前面候选辛苦下的 13MB 直接截成
+# 几百 KB —— 实测踩过，进度全丢，在弱网下永远下不完。
+# 所以每个候选写自己的临时文件，下完只有「哈希对」或「比现有 $dest.part 大」才采纳，
+# 保证 $dest.part 单调增长；换源续传时先把现有进度拷进临时文件，从那儿接着下。
 fetch() {
   local url="$1" dest="$2" want="$3" got cand ok=0
   if [ -f "$dest" ] && [ "$(sha256_of "$dest")" = "$want" ]; then
@@ -84,15 +106,62 @@ fetch() {
     return 0
   fi
   echo "  ↓ $(basename "$dest")"
-  while IFS= read -r cand; do
-    # shellcheck disable=SC2086
-    if curl -fL $CURL_OPTS --max-time 600 -o "$dest.part" "$cand" 2>/dev/null; then
-      got="$(sha256_of "$dest.part")"
-      if [ "$got" = "$want" ]; then ok=1; break; fi
-      echo "      候选哈希不符，换下一个来源：$(echo "$cand" | cut -d/ -f3)" >&2
-    fi
-    rm -f "$dest.part"
-  done < <(urls_for "$url")
+
+  # best 必须从「已有的进度」起算，不能从 0 起算：上一轮构建中断会留下一个
+  # 十几 MB 的 .part，若从 0 起算，本轮一个不认 Range 的源回吐 300 KB 也会被
+  # 当成「更长」而采纳，把上次的进度截掉 —— 等于续传白做。实测复现过。
+  local pass=0 base=0 tmp grew idx
+  local best=0
+  if [ -s "$dest.part" ]; then best="$(stat -c %s "$dest.part")"; fi
+  while [ "$pass" -lt "$MAX_PASSES" ]; do
+    pass=$((pass + 1))
+    grew=0
+    idx=0
+    while IFS= read -r cand; do
+      idx=$((idx + 1))
+      tmp="$dest.part.try$idx"
+      base=0
+      # 接着现有进度下（拷贝而不是改名：$dest.part 在本次尝试失败前不能被破坏）
+      if [ -s "$dest.part" ]; then
+        cp -f "$dest.part" "$tmp"
+        base="$(stat -c %s "$tmp")"
+      else
+        rm -f "$tmp"
+      fi
+
+      # shellcheck disable=SC2086
+      if curl -fL $CURL_OPTS $SLOW_OPTS --max-time "$SRC_BUDGET" \
+              -C - -o "$tmp" "$cand" 2>/dev/null; then
+        got="$(sha256_of "$tmp")"
+        if [ "$got" = "$want" ]; then
+          mv -f "$tmp" "$dest.part"
+          ok=1
+          break
+        fi
+        echo "      候选哈希不符，换下一个来源：$(echo "$cand" | cut -d/ -f3)" >&2
+        rm -f "$tmp"
+        continue
+      fi
+
+      # 采纳「更长」的那份。源不认 Range 时 $tmp 可能比 $base 还短，那种就丢掉。
+      local size
+      size="$(stat -c %s "$tmp" 2>/dev/null || echo 0)"
+      if [ "$size" -gt "$best" ]; then
+        mv -f "$tmp" "$dest.part"
+        best="$size"
+      else
+        rm -f "$tmp"
+      fi
+      if [ "$size" -gt "$base" ]; then
+        grew=1
+        echo "      该源已超时，进度 $((size / 1024 / 1024))MB，换下一个来源续传" >&2
+      fi
+    done < <(urls_for "$url")
+    if [ "$ok" = 1 ]; then break; fi
+    # 一整轮下来一点没长，说明所有源都不通，再轮也没用。
+    if [ "$grew" = 0 ]; then break; fi
+  done
+  rm -f "$dest.part".try*
 
   if [ "$ok" != 1 ]; then
     rm -f "$dest.part"
@@ -104,7 +173,7 @@ fetch() {
   echo "  ✓ $(basename "$dest")  ${got:0:16}…"
 }
 
-echo "== 1/3 工具链 jar → $TOOLCHAIN =="
+echo "== 1/4 工具链 jar → $TOOLCHAIN =="
 # 每行：文件名|URL|sha256|必需性。版本刻意钉死，换版本要同步更新这里的哈希。
 # smali.jar 标 optional：只有轻量路线 scripts/build.sh 用它，全量路线不需要，
 # 所以它下不下来都不该挡住出包。
@@ -128,7 +197,7 @@ MANIFEST
 [ "$fail" = 0 ] || { echo "必需依赖缺失，无法继续。" >&2; exit 1; }
 
 echo
-echo "== 2/3 Android build-tools 34.0.0 → $BT_DIR =="
+echo "== 2/4 Android build-tools 34.0.0 → $BT_DIR =="
 BT_ZIP_URL="https://dl.google.com/android/repository/build-tools_r34-linux.zip"
 BT_ZIP_SHA="e858c4b60069d0431051b225d384413b1643e1289b00a4825aed347f25bd510f"
 if [ -x "$BT_DIR/zipalign" ] && [ -x "$BT_DIR/apksigner" ] && [ -x "$BT_DIR/d8" ]; then
@@ -147,7 +216,7 @@ else
 fi
 
 echo
-echo "== 3/3 Android 34 平台库 → $TOOLCHAIN/android-34.jar =="
+echo "== 3/4 Android 34 平台库 → $TOOLCHAIN/android-34.jar =="
 PLATFORM_URL="https://dl.google.com/android/repository/platform-34-ext7_r03.zip"
 PLATFORM_SHA="16fdb74c55e59ae3ef52def135aec713508467bd56d7dabcd8c9be31fa8b20f3"
 ANDROID_JAR_SHA="6cea1df3efb77103ac3e2beb9bf4718964b0e0869ab16d39d29d5cbae1c147ad"
@@ -166,6 +235,46 @@ else
 fi
 
 echo
+echo "== 4/4 墨听原始 APK（改造对象）=="
+# 上游墨听没有源码公开，只能拿它的发布包做反编译输入。这里从作者的公开
+# 发布仓库下载，哈希与仓库自带的 .sha256 对照校验。
+# 想用别的版本（比如更新的 4.0.20-r2），把 JETHUB_UPSTREAM_APK 指过去即可，
+# 这一步就会跳过。注意菜单注入的锚点是跨版本稳定的（靠文案反查 lambda），
+# 但不同版本的 dex 分包编号不同，脚本会自动适配。
+UPSTREAM_DIR="$ROOT/upstream"
+UPSTREAM_APK="${JETHUB_UPSTREAM_APK:-}"
+UPSTREAM_TAG="${JETHUB_UPSTREAM_TAG:-v4.0.19-r1}"
+UPSTREAM_ASSET="${JETHUB_UPSTREAM_ASSET:-MoTing-4.0.19-r1-40020-9b60b6c0e-arm64-v8a-R8-release.apk}"
+UPSTREAM_SHA="${JETHUB_UPSTREAM_SHA:-1f2b7e9b47db0bba52f4d6588905cfe451dd37ccad7e76b6a8d01828ea4530af}"
+
+if [ -n "$UPSTREAM_APK" ]; then
+  echo "  ✓ 已指定 JETHUB_UPSTREAM_APK=$UPSTREAM_APK，跳过下载"
+  if [ ! -f "$UPSTREAM_APK" ]; then
+    echo "  ✗ 该文件不存在" >&2; exit 1
+  fi
+else
+  mkdir -p "$UPSTREAM_DIR"
+  dest="$UPSTREAM_DIR/$UPSTREAM_ASSET"
+  if [ -f "$dest" ] && [ "$(sha256_of "$dest")" = "$UPSTREAM_SHA" ]; then
+    echo "  ✓ 上游 APK 已就绪"
+  else
+    fetch "https://github.com/jwoo1982217-eng/MoTing-Releases/releases/download/$UPSTREAM_TAG/$UPSTREAM_ASSET" \
+          "$dest" "$UPSTREAM_SHA" || {
+      cat >&2 <<EOF
+  ✗ 上游 APK 下载失败。
+    也可以自己从 https://github.com/jwoo1982217-eng/MoTing-Releases/releases
+    下载墨听安装包，然后：
+        JETHUB_UPSTREAM_APK=/path/to/墨听.apk bash scripts/build-full.sh
+EOF
+      exit 1
+    }
+  fi
+  UPSTREAM_APK="$dest"
+fi
+export JETHUB_UPSTREAM_APK="$UPSTREAM_APK"
+
+echo
 echo "依赖就绪。"
 echo "  ANDROID_BUILD_TOOLS=$BT_DIR"
 echo "  JETHUB_TOOLCHAIN=$TOOLCHAIN"
+echo "  JETHUB_UPSTREAM_APK=$UPSTREAM_APK"

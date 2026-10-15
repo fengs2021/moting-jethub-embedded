@@ -8,9 +8,10 @@ __pycache__/
 *.apk
 *.idsig
 
-# 由 scripts/fetch-deps.sh 拉取的外部依赖（工具链与 Android SDK 片段）
+# 由 scripts/fetch-deps.sh 拉取的外部依赖（工具链、Android SDK 片段、原始墨听 APK）
 toolchain/
 sdk/
+upstream/
 
 # 签名材料
 *.jks

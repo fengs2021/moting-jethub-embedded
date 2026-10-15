@@ -21,9 +21,9 @@
 ② 菜单项注入
    模型中心右上角下拉菜单的构建代码在
    smali_classes*/io/legado/app/ui/book/read/config/MotingAiModelCenterScreenKt.smali，
-   注入点是 MotingAiModelCenterScreen$lambda$120$2$1$2 内、line 529 的
-   AppDropdownMenuItem（即《管理网页转 API》）之后。文案与点击行为由两个 smali 胶水类提供
-   （见 smali-glue/，不进 Java 源码）：
+   注入点是《管理网页转 API》那一项之后。定位方式是**用文案反查**，不按行号
+   —— 行号随上游版本漂移，换个版本就命中 0 次（见 find_label_lambda_id）。
+   文案与点击行为由两个 smali 胶水类提供（见 smali-glue/，不进 Java 源码）：
      - jet/android/JetHubMenuLabel  —— Compose 文案
      - jet/android/JetHubMenuAction —— 点击后 startActivity(JetHubActivity)
 """
@@ -35,38 +35,108 @@ import sys
 MARK = "# JETHUB-MENU-INJECTED"
 SCREEN_REL = "io/legado/app/ui/book/read/config/MotingAiModelCenterScreenKt.smali"
 
-NEW_ITEM = """    .line 529
-    invoke-static/range {v4 .. v15}, Lio/legado/app/ui/widget/components/menuItem/AppDropdownMenuKt;->AppDropdownMenuItem(Lkotlin/jvm/functions/Function2;Lkotlin/jvm/functions/Function0;Landroidx/compose/ui/Modifier;Lkotlin/jvm/functions/Function2;Lkotlin/jvm/functions/Function2;ZLandroidx/compose/material3/MenuItemColors;Landroidx/compose/foundation/layout/PaddingValues;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/runtime/Composer;II)V
+# 《管理网页转 API》的文案。smali 里是非 ASCII 字符的 \uXXXX 转义形态，
+# 所以这里用 raw 字符串原样匹配。菜单项就是靠这段文案反查出来的，
+# 而不是靠行号 —— 原因见 find_label_lambda_id()。
+LABEL_ESCAPED = r"\u7ba1\u7406\u7f51\u9875\u8f6c API"
 
-    %s
-    new-instance v4, Ljet/android/JetHubMenuLabel;
+SINGLETONS_REL = ("io/legado/app/ui/book/read/config/"
+                  "ComposableSingletons$MotingAiModelCenterScreenKt.smali")
 
-    invoke-direct {v4}, Ljet/android/JetHubMenuLabel;-><init>()V
+# Compose 给每个 lambda 生成的 trace 字符串里带着 ID，形如
+#   ...ComposableSingletons$MotingAiModelCenterScreenKt.lambda$2085309646.<anonymous> (MotingAiModelCenterScreen.kt:529)
+LABEL_TRACE_RE = re.compile(r"lambda\$(-?\d+)\.<anonymous>")
 
-    new-instance v5, Ljet/android/JetHubMenuAction;
+# AppDropdownMenuItem 的参数个数（Function2、Function0、Modifier、Function2、
+# Function2、Z、MenuItemColors、PaddingValues、MutableInteractionSource、
+# Composer、II）—— 也就是菜单项那一行的寄存器个数。
+ITEM_PARAMS = 12
 
-    invoke-direct {v5}, Ljet/android/JetHubMenuAction;-><init>()V
 
-    const/4 v6, 0x0
+def find_label_lambda_id(root):
+    """找到渲染《管理网页转 API》的那个 lambda，返回它的 ID 字符串。
 
-    const/4 v7, 0x0
+    为什么绕这一圈，而不是直接按行号找菜单项：
+    菜单项的 `.line` 行号随版本漂移（4.0.20 是 529，4.0.19-r1 是 525），
+    按行号做锚点换个版本就命中 0 次；而旧脚本在锚点未命中时只打印一行警告
+    就继续往下跑，最终产出一个「看起来正常、实际点不进 JetHub」的 APK。
+    改用文案反查：渲染这段文案的 lambda，其 trace 字符串里带着 Compose 编译器
+    按 lambda 源码内容生成的 ID，这个 ID 跨版本稳定（4.0.19-r1 与 4.0.20 上
+    都是 2085309646）。文案改了就报错退出，不会再静默产出坏包。
+    """
+    import glob
+    hits = sorted(glob.glob(os.path.join(root, "smali_classes*", SINGLETONS_REL)))
+    if not hits:
+        hits = sorted(glob.glob(os.path.join(root, "smali", SINGLETONS_REL)))
+    if len(hits) != 1:
+        sys.exit("[menu] 找到 %d 份 %s，无法确定菜单文案所在文件"
+                 % (len(hits), SINGLETONS_REL))
 
-    const/4 v8, 0x0
+    ids = set()
+    cur = None
+    for line in io.open(hits[0], encoding="utf-8"):
+        s = line.strip()
+        if s.startswith(".method"):
+            cur = None          # 换方法就重置，避免把文案算到隔壁 lambda 头上
+            continue
+        m = LABEL_TRACE_RE.search(s)
+        if m:
+            cur = m.group(1)
+            continue
+        if cur and "const-string" in s and LABEL_ESCAPED in s:
+            ids.add(cur)
 
-    const/4 v9, 0x0
+    if len(ids) != 1:
+        sys.exit("[menu] 找不到唯一渲染《管理网页转 API》的 lambda（命中 %d 个），"
+                 "上游界面可能已改版" % len(ids))
+    return ids.pop()
 
-    const/4 v10, 0x0
 
-    const/4 v11, 0x0
+def build_item(regs, line_no):
+    """按已有菜单项的寄存器布局，拼出一条新的 AppDropdownMenuItem 调用。
 
-    const/4 v12, 0x0
+    regs 是从真实菜单项那一行抄来的寄存器范围（形如 "v4 .. v15"），共 12 个：
+      base+0 文案 Function2  ← JetHubMenuLabel
+      base+1 点击 Function0  ← JetHubMenuAction
+      base+2..8 其余参数，全填 0
+      base+9 Composer —— 沿用方法里现成的那个，不动
+      base+10、base+11 两个 int 参数，沿用真实项的取值 0x6 / 0x1fc
 
-    const/4 v14, 0x6
+    寄存器号从真实项抄，不写死 v4..v15：注入点换了方法或编译器换了分配策略时，
+    抄来的布局一定是对的，写死的就不一定。
+    """
+    m = re.match(r"(v\d+) \.\. (v\d+)$", regs)
+    if not m:
+        sys.exit("[menu] 无法解析菜单项寄存器范围：%s" % regs)
+    base, last = int(m.group(1)[1:]), int(m.group(2)[1:])
+    if last - base + 1 != ITEM_PARAMS:
+        sys.exit("[menu] 菜单项寄存器 %d 个（期望 %d 个），布局已变，请人工确认"
+                 % (last - base + 1, ITEM_PARAMS))
 
-    const/16 v15, 0x1fc
+    def v(n):
+        return "v%d" % (base + n)
 
-    invoke-static/range {v4 .. v15}, Lio/legado/app/ui/widget/components/menuItem/AppDropdownMenuKt;->AppDropdownMenuItem(Lkotlin/jvm/functions/Function2;Lkotlin/jvm/functions/Function0;Landroidx/compose/ui/Modifier;Lkotlin/jvm/functions/Function2;Lkotlin/jvm/functions/Function2;ZLandroidx/compose/material3/MenuItemColors;Landroidx/compose/foundation/layout/PaddingValues;Landroidx/compose/foundation/interaction/MutableInteractionSource;Landroidx/compose/runtime/Composer;II)V
-""" % MARK
+    sig = ("Lkotlin/jvm/functions/Function2;Lkotlin/jvm/functions/Function0;"
+           "Landroidx/compose/ui/Modifier;Lkotlin/jvm/functions/Function2;"
+           "Lkotlin/jvm/functions/Function2;Z"
+           "Landroidx/compose/material3/MenuItemColors;"
+           "Landroidx/compose/foundation/layout/PaddingValues;"
+           "Landroidx/compose/foundation/interaction/MutableInteractionSource;"
+           "Landroidx/compose/runtime/Composer;II)V")
+    out = ["    %s" % MARK,
+           "    .line %s" % line_no,
+           "    new-instance %s, Ljet/android/JetHubMenuLabel;" % v(0), "",
+           "    invoke-direct {%s}, Ljet/android/JetHubMenuLabel;-><init>()V" % v(0), "",
+           "    new-instance %s, Ljet/android/JetHubMenuAction;" % v(1), "",
+           "    invoke-direct {%s}, Ljet/android/JetHubMenuAction;-><init>()V" % v(1), ""]
+    for i in range(2, 9):
+        out += ["    const/4 %s, 0x0" % v(i), ""]
+    out += ["    const/4 %s, 0x6" % v(10), "",
+            "    const/16 %s, 0x1fc" % v(11), "",
+            "    invoke-static/range {%s}, "
+            "Lio/legado/app/ui/widget/components/menuItem/AppDropdownMenuKt;->"
+            "AppDropdownMenuItem(%s" % (regs, sig)]
+    return "\n".join(out) + "\n"
 
 
 def resolve_screen(root):
@@ -173,25 +243,48 @@ def install_glue(root):
     return True
 
 
+CALL_RE = re.compile(
+    r"(?m)^(    \.line (\d+)\n)"
+    r"(    invoke-static/range \{(v\d+) \.\. (v\d+)\}, "
+    r"Lio/legado/app/ui/widget/components/menuItem/AppDropdownMenuKt;->"
+    r"AppDropdownMenuItem\()")
+
+
 def patch_menu(root):
+    """在《管理网页转 API》菜单项之后插入《管理平台代理 API》。
+
+    定位方式：先用文案反查出《管理网页转 API》的 lambda（见 find_label_lambda_id），
+    再从这个 lambda 的 getter 往后找第一条 AppDropdownMenuItem 调用 —— 那条就是
+    《管理网页转 API》。寄存器布局与 `.line` 都从这条真实调用上抄，不写死。
+
+    失败一律 sys.exit，不再「打印警告后继续」：这条路一旦漏掉，产出的包看起来
+    完全正常，只是用户点不进 JetHub —— 属于最难发现的一类缺陷。
+    """
     screen = resolve_screen(root)
     with io.open(screen, encoding="utf-8") as f:
         src = f.read()
     if MARK in src:
         print("[menu] 已打过补丁，跳过")
         return False
-    anchor = "    .line 529\n    invoke-static/range {v4 .. v15}, Lio/legado/app/ui/widget/components/menuItem/AppDropdownMenuKt;->AppDropdownMenuItem("
-    n = src.count(anchor)
+
+    lam = find_label_lambda_id(root)
+    getter = "getLambda$%s$app()" % lam
+    n = src.count(getter)
     if n != 1:
-        print("[menu] !! 锚点命中 %d 次（期望 1），中止" % n)
-        return False
-    idx = src.index(anchor)
-    # 找到该 invoke 行结束（行尾）
-    end = src.index("\n", src.index("(Lkotlin/jvm/functions/Function2;", idx))
-    out = src[:end + 1] + "\n" + NEW_ITEM + src[end + 1:]
+        sys.exit("[menu] %s 出现 %d 次（期望 1），无法确定注入点" % (getter, n))
+
+    m = CALL_RE.search(src, src.index(getter))
+    if not m:
+        sys.exit("[menu] %s 之后找不到 AppDropdownMenuItem 调用，上游界面可能已改版"
+                 % getter)
+
+    regs = "%s .. %s" % (m.group(4), m.group(5))
+    end = src.index("\n", m.end()) + 1        # 该 invoke 行的行尾
+    out = src[:end] + "\n" + build_item(regs, m.group(2)) + src[end:]
     with io.open(screen, "w", encoding="utf-8") as f:
         f.write(out)
-    print("[menu] 已在《管理网页转 API》后插入《管理平台代理 API》")
+    print("[menu] 已在《管理网页转 API》(lambda$%s, .line %s, 寄存器 %s) 后"
+          "插入《管理平台代理 API》" % (lam, m.group(2), regs))
     return True
 
 

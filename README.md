@@ -20,23 +20,49 @@
 git clone https://github.com/fengs2021/moting-jethub-embedded
 cd moting-jethub-embedded
 
-# 1) 拉取工具链与 Android SDK 片段（约 150 MB，逐字节校验 sha256）
-bash scripts/fetch-deps.sh
-
-# 2) 指向你自己的墨听原始 APK，一条命令出成品
-JETHUB_UPSTREAM_APK=/path/to/墨听.apk \
+# 一条命令：自动拉工具链 + Android SDK 片段 + 原始墨听 APK，然后出成品
 JETHUB_KEYSTORE=/path/to/your.jks JETHUB_KS_PASS='***' \
   bash scripts/build-full.sh
 ```
 
 产物是 `墨听-4.0.20-jethub内置版.apk`。
 
-**唯一需要自备的输入是墨听原始 APK** —— 它是第三方软件，本仓库不重新分发。版本要求
-4.0.20-r2（`com.applecabal.njread`，versionCode 40023）。不提供 `JETHUB_KEYSTORE` 也能跑，
-但产出的是未签名包，只能本地验证、不能安装分发。
+**不需要自备任何东西。** 工具链、Android SDK 片段、原始墨听 APK 全部由 `fetch-deps.sh`
+自动下载并逐个校验 sha256（原始 APK 与上游发布仓库自带的 `.sha256` 对照）。不提供
+`JETHUB_KEYSTORE` 也能跑，但产出的是未签名包，只能本地验证、不能安装分发。
 
 前置条件只有三样：**JDK 11+**（`javac`）、**python3**、**curl/unzip**。apktool、d8、
-baksmali、zipalign、apksigner 全部由 `fetch-deps.sh` 备好，不需要预装 Android SDK。
+baksmali、zipalign、apksigner 全部自动备好，不需要预装 Android SDK。
+
+想用别的墨听版本（比如你手上更新的 4.0.20-r2）就把它指过来，自动下载那步会跳过：
+
+```bash
+JETHUB_UPSTREAM_APK=/path/to/墨听.apk bash scripts/build-full.sh
+```
+
+---
+
+## 上游墨听 APK 从哪来
+
+改造对象是墨听 Android 客户端。它没有公开源码，所以只能拿发布包做反编译输入。
+默认从作者的公开发布仓库下载：
+
+- 仓库：<https://github.com/jwoo1982217-eng/MoTing-Releases>
+- 默认版本：`v4.0.19-r1`（`MoTing-4.0.19-r1-40020-9b60b6c0e-arm64-v8a-R8-release.apk`）
+- sha256：`1f2b7e9b47db0bba52f4d6588905cfe451dd37ccad7e76b6a8d01828ea4530af`
+
+换版本用 `JETHUB_UPSTREAM_TAG` / `JETHUB_UPSTREAM_ASSET` / `JETHUB_UPSTREAM_SHA` 三个变量，
+或者干脆用 `JETHUB_UPSTREAM_APK` 指向本地文件。
+
+各版本差异（都已实测能出包）：
+
+| 版本 | versionCode | dex 数 | 说明 |
+|------|-------------|--------|------|
+| 4.0.19-r1 | 40020 | 7 | 公开发布仓库最新版，默认 |
+| 4.0.20-r2 | 40023 | 8 | 开发时用的版本，需自备 |
+
+补丁脚本对 dex 分包编号是自适应的（按 `smali_classes*` glob 找目标文件），菜单注入锚点
+也是版本无关的 —— 靠菜单文案反查 Compose 生成的 lambda id，而不是靠行号。
 
 ---
 
@@ -121,6 +147,24 @@ Maven Central：直连 → https://maven.aliyun.com/repository/public/（json）
 所有来源都过 sha256 校验，镜像即使被投毒也进不来；上面这些镜像的返回内容已逐个实测与
 官方哈希一致。
 
+### 慢链路与断点续传
+
+上游 APK 有 68 MB，工具链加起来也有 40 MB。弱网下真正的问题不是「下不动」而是「下不完」：
+
+- 每个源最多占用 `JETHUB_SRC_BUDGET`（默认 300）秒，超时就换下一个候选，**已下的部分
+  通过 `curl -C -` 续传**，不从零重来。实测同一条链路上直连 42 KB/s、`gh-proxy.com`
+  155 KB/s，只按「死没死」判断的话慢源永远不算死，会一直霸着不放，所以要有这个让位机制。
+- 一个源如果连上却一个字节都不长（多半不支持 Range），它的残留文件会挡住后面的源，脚本会丢掉它。
+- 进度文件 `$dest.part` 只增不减：每个候选写自己的临时文件，只有「哈希对」或「比现有进度长」
+  才被采纳。因为有的源不认 `Range`（回 200 而不是 206），curl 会从偏移 0 重写 —— 若共用一个
+  进度文件，换源时就会把前面下的十几 MB 截成几百 KB，在弱网下永远下不完。
+- 所有候选轮完算一轮，最多 `JETHUB_MAX_PASSES`（默认 10）轮；**一整轮下来一个字节都没长
+  就提前结束**，所以轮数给宽不会浪费时间。
+- `--speed-limit 1024 --speed-time 60` 兜底：连续 60 秒低于 1 KB/s 才判定该源已死。
+
+（历史教训：早先这里用的是 `curl --max-time 600`，68 MB 的包在 42 KB/s 链路上需要 27 分钟，
+600 秒一到 curl 被杀且没有续传，下一轮从 0 重来——在这种链路上永远下不完。）
+
 若本机的 `HTTP_PROXY` 指向一个不通的代理，curl 会连不上，先
 `unset HTTP_PROXY HTTPS_PROXY ALL_PROXY`。
 
@@ -142,7 +186,7 @@ Maven Central：直连 → https://maven.aliyun.com/repository/public/（json）
 ### 一条命令出包
 
 ```bash
-JETHUB_UPSTREAM_APK=/path/to/墨听.apk bash scripts/build-full.sh
+bash scripts/build-full.sh
 ```
 
 `build-full.sh` 的九步：
@@ -192,6 +236,16 @@ dex 分包编号随墨听版本变化，不能硬编码。
 3. **在《管理网页转 API》下方插入《管理平台代理 API》** —— 菜单由 Compose 构建，
    注入点是 `MotingAiModelCenterScreenKt` 里 `AppDropdownMenuItem` 的那次调用；
    文案与点击行为来自 `smali-glue/` 的两个类。
+   定位方式**不是按行号**：先拿菜单文案 `"\u7ba1\u7406\u7f51\u9875\u8f6c API"` 去
+   `ComposableSingletons$MotingAiModelCenterScreenKt.smali` 里反查它所属的 lambda
+   trace id（`lambda$<id>.<anonymous>`），再用这个 id 对应的
+   `getLambda$<id>$app()` 定位调用点。行号随上游版本漂移（4.0.20 是 `.line 529`、
+   4.0.19-r1 是 `.line 525`），按行号做锚点换个版本就命中 0 次；lambda id 由内容派生，
+   两个版本上完全一致（`2085309646`）。
+   顺带修掉一个老缺陷：早期模板会**把锚点那一行原样重发一遍**再追加新项，每注入一次就多出
+   一个重复的《管理网页转 API》（已发布的 4.0.20 成品包里就有这个重复项）。现在不再复刻原行。
+   所有失败路径一律 `sys.exit` 非零 —— 之前是「打印警告后照常退出 0」，而 `build-full.sh`
+   的 `set -e` 抓不住，会静默产出**没有菜单入口**的 APK。
 4. **往 `App.onCreate()` 注入 `Boot.init()`** —— 拉起内嵌网关。锚点用正则匹配
    `.method public onCreate()V` 后跟 `.registers N` 或 `.locals N`，因为两种写法等价、
    随 apktool 参数而变；注入指令只用 `p0`，不改变寄存器分配。
@@ -227,7 +281,10 @@ smali 中（`BuildConfig.APPLICATION_ID`、三个 provider authorities、取包�
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `JETHUB_UPSTREAM_APK` | — | 墨听原始 APK（必填） |
+| `JETHUB_UPSTREAM_APK` | 自动下载到 `./upstream/` | 墨听原始 APK；指定了就跳过下载 |
+| `JETHUB_UPSTREAM_TAG` | `v4.0.19-r1` | 上游 release tag |
+| `JETHUB_UPSTREAM_ASSET` | `MoTing-4.0.19-r1-…-R8-release.apk` | 上游资产名 |
+| `JETHUB_UPSTREAM_SHA` | `1f2b7e9b…4530af` | 上游资产 sha256 |
 | `ANDROID_BUILD_TOOLS` | `./sdk/build-tools/34.0.0` | 含 zipalign/apksigner/d8 |
 | `JETHUB_TOOLCHAIN` | `./toolchain` | jar 目录 |
 | `JETHUB_SDK` | `./sdk` | SDK 片段目录 |
@@ -238,6 +295,9 @@ smali 中（`BuildConfig.APPLICATION_ID`、三个 provider authorities、取包�
 | `JETHUB_REDECODE` | 空 | 非空则强制重新解包 |
 | `JETHUB_SKIP_DEPS` | 空 | 非空则跳过依赖自举 |
 | `JETHUB_GH_MIRRORS` | 见上 | GitHub 加速镜像列表（空格分隔） |
+| `JETHUB_SRC_BUDGET` | `300` | 单个下载源最多占用多少秒，超时换下一个候选（续传接着下） |
+| `JETHUB_MAX_PASSES` | `10` | 候选轮完算一轮；最多几轮。一整轮一个字节都没长就提前停 |
+| `JETHUB_SLOW_OPTS` | `--speed-limit 1024 --speed-time 60` | 连续 60 秒低于 1 KB/s 判定该源已死 |
 | `JETHUB_JAVA_OPTS` | `-Dfile.encoding=UTF-8` | 传给 `java` 的 JVM 参数 |
 | `JETHUB_JAVAC_OPTS` | `-J-Dfile.encoding=UTF-8` | 传给 `javac` 的 JVM 参数 |
 
@@ -256,7 +316,9 @@ smali 放进对应 `smali_classesN/` 即可，`patch-ui.py` 会引用它们。
 账号。请遵守各平台的服务条款；因使用本项目产生的账号风险由使用者自负。
 仓库中不包含任何平台凭据、token 或私钥。
 
-墨听（Legado 衍生版）的著作权归其原作者所有；本仓库只分发改造工程，不重新分发原 APK。
+墨听（Legado 衍生版）的著作权归其原作者所有。本仓库只分发改造工程，不重新分发原 APK ——
+`fetch-deps.sh` 只是从上游作者自己的发布仓库下载，且校验其官方 `.sha256`。改造产物仅供
+个人学习与自用，请勿用于商业分发。
 
 ## License
 

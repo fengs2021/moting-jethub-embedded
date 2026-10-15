@@ -61,8 +61,17 @@ JETHUB_UPSTREAM_APK=/path/to/墨听.apk bash scripts/build-full.sh
 | 4.0.19-r1 | 40020 | 7 | 公开发布仓库最新版，默认 |
 | 4.0.20-r2 | 40023 | 8 | 开发时用的版本，需自备 |
 
-补丁脚本对 dex 分包编号是自适应的（按 `smali_classes*` glob 找目标文件），菜单注入锚点
-也是版本无关的 —— 靠菜单文案反查 Compose 生成的 lambda id，而不是靠行号。
+补丁脚本对 dex 分包编号是自适应的（按 `smali_classes*` glob 找目标文件），注入用的分包编号
+也**不写死** —— 取「现有最大编号 +1」（见下），菜单注入锚点同样是版本无关的：靠菜单文案反查
+Compose 生成的 lambda id，而不是靠行号。
+
+> **为什么分包编号必须动态取**：Android 运行时按 `classes.dex`、`classes2.dex`、`classes3.dex`…
+> 的顺序扫描，**遇到第一个缺失的编号就停下**，后面的 dex 一律不加载。上游 4.0.20 有 8 个 dex，
+> 把新代码写进 `classes9/classes10` 刚好连续；但 4.0.19-r1 只有 7 个 dex，`classes8` 是空的，
+> 此时写进 `classes9/classes10` 就等于把注入的类藏进了加载器不看的地方 —— 结果
+> `Boot` / `JetHubActivity` / 胶水类 / 注册器一个都加载不到，应用一启动就
+> `NoClassDefFoundError: Failed resolution of: Ljet/android/Boot;` 闪退。
+> 而 apktool 回编、签名、产物结构检查全都正常，**只有装到机器上才炸**。
 
 ---
 
@@ -197,7 +206,7 @@ bash scripts/build-full.sh
 | 2 | host 侧单测（模型注册表合并逻辑，不需要 Android 运行时） |
 | 3 | `apktool d` 解包上游 APK → `full-decoded/`（已存在则跳过，`JETHUB_REDECODE=1` 强制重解） |
 | 4 | 同步管理页 `assets/jethub/home.html` 进反编译树 |
-| 5 | `d8` 把 `jet/**` 打成 dex，再 `baksmali` 成 `smali_classes9/` |
+| 5 | `d8` 把 `jet/**` 打成 dex，再 `baksmali` 成下一个空闲分包（现有最大编号 +1，见上） |
 | 6 | 打补丁：胶水类 / manifest 注册 / 菜单注入 / Boot 注入 / 模型中心刷新（全部幂等） |
 | 7 | 改包名（可选，设了 `JETHUB_PACKAGE` 才做） |
 | 8 | `apktool b` 全量回编 |
@@ -230,7 +239,7 @@ dex 分包编号随墨听版本变化，不能硬编码。
 
 `patches/patch-ui.py` 做四件事，都在脚本头部注释里写了原因：
 
-1. **放胶水类** —— 把 `smali-glue/` 下的两个 smali 拷进 `smali_classes10/`。
+1. **放胶水类** —— 把 `smali-glue/` 下的两个 smali 拷进下一个空闲分包（`build-full.sh` 用的编号 +1）。
 2. **注册 JetHubActivity 并去掉 LAUNCHER** —— 上游原包里没有这个 Activity，所以要先注册；
    入口应该在墨听自己的《AI 模型与接口中心》里，桌面上再放一个图标是重复的。
 3. **在《管理网页转 API》下方插入《管理平台代理 API》** —— 菜单由 Compose 构建，

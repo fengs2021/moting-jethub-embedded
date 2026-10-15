@@ -93,15 +93,26 @@ echo "[4/9] 同步管理页资源到反编译树"
 mkdir -p "$DECODED/assets/jethub"
 cp assets/jethub/home.html "$DECODED/assets/jethub/home.html"
 
-echo "[5/9] d8 → dex，baksmali → smali_classes9"
+echo "[5/9] d8 → dex，baksmali → smali（分包编号按现有最大编号 +1）"
+# 编号不能写死：Android 运行时按 classes.dex、classes2.dex… 顺序扫描，遇到第一个
+# 缺失的编号就停下，后面的 dex 全不加载。上游 4.0.20 有 8 个 dex（写进 9/10 刚好
+# 连续），4.0.19-r1 只有 7 个 dex（写进 9/10 就跳过 classes8，注入的类全部加载不到，
+# 应用启动即 NoClassDefFoundError 闪退）。
+JET_SLOT="$(jethub_next_dex_slot "$DECODED")"
+if [ "$JET_SLOT" = 1 ]; then
+  JET_DIR="$DECODED/smali"
+else
+  JET_DIR="$DECODED/smali_classes$JET_SLOT"
+fi
+echo "  现有最大分包后 → $(basename "$JET_DIR")"
 rm -rf build/dex build/smali9 && mkdir -p build/dex
 "$ANDROID_BUILD_TOOLS/d8" --release --min-api 29 \
   --lib "$TOOLCHAIN/android-34.jar" --output build/dex $(find build/classes/jet -name '*.class')
-rm -rf "$DECODED/smali_classes9"
-java $JETHUB_JAVA_OPTS -Xmx3g -jar "$BAKSMALI" d build/dex/classes.dex -o "$DECODED/smali_classes9"
+rm -rf "$JET_DIR"
+java $JETHUB_JAVA_OPTS -Xmx3g -jar "$BAKSMALI" d build/dex/classes.dex -o "$JET_DIR"
 
 echo "[6/9] 打补丁（幂等：已打过则跳过）"
-# 顺序有意义：install_glue 先把胶水类放进 smali_classes10，
+# 顺序有意义：install_glue 先把胶水类放进下一个空分包，
 # patch_menu 才能在 MotingAiModelCenterScreenKt 里引用到它们。
 python3 patches/patch-ui.py "$DECODED"
 python3 patches/patch-refresh.py "$DECODED"

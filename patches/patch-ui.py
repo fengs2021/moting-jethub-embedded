@@ -212,13 +212,42 @@ def patch_manifest(root):
     return True
 
 
+def next_dex_slot(root):
+    """返回下一个可用的 dex 分包编号（smali → 1，smali_classesN → N）。
+
+    必须取「现有最大编号 +1」，不能写死。
+    Android 运行时按 classes.dex、classes2.dex、classes3.dex… 的顺序扫描，**遇到
+    第一个缺失的编号就停下**，后面的 dex 一律不加载。上游墨听 4.0.20 有 8 个 dex，
+    我们写进 classes9/classes10 刚好连续，所以从没暴露过问题；但 4.0.19-r1 只有
+    7 个 dex，classes8 是空的，注入的类全在 classes9/10 里 —— 结果
+    Boot / JetHubActivity / 胶水类 / 注册器一个都加载不到，应用一启动就
+      NoClassDefFoundError: Failed resolution of: Ljet/android/Boot;
+    直接闪退。而 apktool 回编、签名、产物结构检查全都正常，只有装到机器上才炸。
+    """
+    import glob as _glob
+    maxn = 1
+    for d in _glob.glob(os.path.join(root, "smali*")):
+        if not os.path.isdir(d):
+            continue
+        name = os.path.basename(d)
+        if name == "smali":
+            n = "1"
+        elif name.startswith("smali_classes"):
+            n = name[len("smali_classes"):]
+        else:
+            continue
+        if not n.isdigit():
+            continue
+        maxn = max(maxn, int(n))
+    return maxn + 1
+
+
 def install_glue(root):
     """把 smali-glue/ 下的胶水类复制进反编译树。
 
     这两个类是 Compose 的 Function2/Function0 实现，写成 Java 反而更绕，所以直接
-    以 smali 形式提供。它们必须落在 MotingAiModelCenterScreenKt 所在的同一个 dex
-    分包里（否则跨 dex 引用没问题，但 patch-ui.py 的注入点按包名找不到）。
-    这里统一放进 smali_classes10/ —— 正式发布包就是这么放的。
+    以 smali 形式提供。存放位置取「下一个空着的 dex 分包编号」（见 next_dex_slot）：
+    build-full.sh 已经把 jet 代码放进前一个编号，这里紧跟其后，保证分包编号连续。
     """
     import glob
     import shutil
@@ -227,19 +256,23 @@ def install_glue(root):
     if not os.path.isdir(glue_src):
         print("[glue] 跳过：%s 不存在" % glue_src)
         return False
-    # 胶水类要放进一个「已经存在」的 smali 分包，优先 classes10，否则新建
-    target = os.path.join(root, "smali_classes10")
-    if not os.path.isdir(target):
-        os.makedirs(os.path.join(target, "jet", "android"))
+    slot = next_dex_slot(root)
+    name = "smali" if slot == 1 else "smali_classes%d" % slot
+    target = os.path.join(root, name)
+    os.makedirs(os.path.join(target, "jet", "android"), exist_ok=True)
     installed = []
-    for src in glob.glob(os.path.join(glue_src, "smali_classes*", "**", "*.smali"),
+    for src in glob.glob(os.path.join(glue_src, "smali*", "**", "*.smali"),
                          recursive=True):
-        rel = os.path.relpath(src, os.path.join(glue_src, "smali_classes10"))
+        # 源目录名（smali-glue/smali_classes10/...）只是摆放习惯，取相对路径时把它剥掉
+        rel = os.path.relpath(src, glue_src)
+        parts = rel.split(os.sep)
+        if parts and (parts[0] == "smali" or parts[0].startswith("smali_classes")):
+            rel = os.path.join(*parts[1:])
         dst = os.path.join(target, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copyfile(src, dst)
         installed.append(rel)
-    print("[glue] 已放入 smali_classes10/：%s" % ", ".join(installed))
+    print("[glue] 已放入 %s/：%s" % (name, ", ".join(installed)))
     return True
 
 

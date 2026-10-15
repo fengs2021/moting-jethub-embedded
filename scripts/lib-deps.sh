@@ -44,6 +44,33 @@ jethub_force_utf8() {
 }
 jethub_force_utf8
 
+# jethub_next_dex_slot <反编译树根>
+# 返回下一个可用的 dex 分包编号（smali → 1，smali_classesN → N）。
+#
+# 必须取「现有最大编号 +1」，不能写死。
+# Android 运行时按 classes.dex、classes2.dex、classes3.dex… 的顺序扫描，**遇到第一个
+# 缺失的编号就停下**，后面的 dex 一律不加载。上游墨听 4.0.20 有 8 个 dex，我们写进
+# classes9/classes10 刚好连续，所以从没暴露过问题；但 4.0.19-r1 只有 7 个 dex，
+# classes8 是空的，我们注入的类全在 classes9/10 里 —— 结果 Boot/JetHubActivity/
+# 胶水类/注册器一个都加载不到，应用一启动就
+#   NoClassDefFoundError: Failed resolution of: Ljet/android/Boot;
+# 直接闪退。而且 apktool 回编、签名、产物结构检查全都正常，只有装到机器上才炸。
+jethub_next_dex_slot() {
+  local root="$1" max=1 d n
+  for d in "$root"/smali "$root"/smali_classes*; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    if [ "$n" = "smali" ]; then
+      n=1
+    else
+      n="${n#smali_classes}"
+    fi
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    [ "$n" -gt "$max" ] && max="$n"
+  done
+  echo $((max + 1))
+}
+
 # jethub_upstream_apk
 # 解析「要改造的原始墨听 APK」的路径，按优先级：
 #   1. 调用者显式给的 JETHUB_UPSTREAM_APK

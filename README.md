@@ -107,9 +107,21 @@ docs/             里程碑日志
 | `build-tools/34.0.0` | [build-tools_r34-linux.zip](https://dl.google.com/android/repository/build-tools_r34-linux.zip) | d8 / zipalign / apksigner / aapt2 |
 | `android-34.jar` | [platform-34-ext7_r03.zip](https://dl.google.com/android/repository/platform-34-ext7_r03.zip) | javac 编译用的平台库 |
 
-若 GitHub 直连不畅，用 `JETHUB_GH_MIRROR=https://ghfast.top/` 指定加速前缀（只作用于
-GitHub 域名，Maven 与 dl.google.com 仍直连）。若本机的 `HTTP_PROXY` 指向一个不通的代理，
-先 `unset HTTP_PROXY HTTPS_PROXY ALL_PROXY`，否则 curl 会连不上。
+GitHub 在国内是**间歇性可达**的：同一个 URL 这次能下、下次超时。所以 `fetch-deps.sh` 对
+GitHub 资源按「直连 → 镜像」顺序逐个尝试，任何一个成功即止：
+
+```
+直连 → https://gh-proxy.com/ → https://ghproxy.net/ → https://ghfast.top/
+```
+
+想换一组镜像就设 `JETHUB_GH_MIRRORS="https://a/ https://b/"`（空格分隔）。所有来源都过
+sha256 校验，镜像即使被投毒也进不来。Maven 与 dl.google.com 不走镜像。
+
+若本机的 `HTTP_PROXY` 指向一个不通的代理，curl 会连不上，先
+`unset HTTP_PROXY HTTPS_PROXY ALL_PROXY`。
+
+`smali.jar` 标记为可选：只有轻量路线 `build.sh` 需要它，全量路线用不上，所以它下不下来
+都不会挡住出包。
 
 ### 一条命令出包
 
@@ -136,8 +148,12 @@ JETHUB_UPSTREAM_APK=/path/to/墨听.apk bash scripts/build-full.sh
 三者缺一，装出来的包就没有入口 —— 网关在后台跑着，但用户点不进去。
 
 `scripts/build.sh` 是另一条**轻量路线**（只替换 `classes4.dex`、追加 `classes9.dex`，
-其余条目从原包原样复制），对加固包的容忍度高，但它**只适用于反编译树已手工打好补丁的
-场景**，不能从零复现出带入口的成品。除非你在做增量调试，否则用 `build-full.sh`。
+其余条目从原包原样复制）。它改不了 `AndroidManifest.xml`、也加不了新的 smali 包，所以
+**它产出的包没有 JetHub 入口** —— 网关在后台跑着，但用户点不进去。
+
+它的用途只有一个：在已经用 `build-full.sh` 全量回编过、且已打好补丁的反编译树上做增量
+调试，改几行 Java 后只重编 dex，省掉几分钟的 apktool 回编。**要出成品一律用
+`build-full.sh`。**
 
 ### 补丁脚本
 
@@ -205,7 +221,7 @@ smali 中（`BuildConfig.APPLICATION_ID`、三个 provider authorities、取包�
 | `JETHUB_OUT` | `墨听-4.0.20-jethub内置版.apk` | 产物名 |
 | `JETHUB_REDECODE` | 空 | 非空则强制重新解包 |
 | `JETHUB_SKIP_DEPS` | 空 | 非空则跳过依赖自举 |
-| `JETHUB_GH_MIRROR` | 空 | GitHub 加速前缀 |
+| `JETHUB_GH_MIRRORS` | 见上 | GitHub 加速镜像列表（空格分隔） |
 
 所有路径与口令都从环境变量读取，脚本里没有硬编码。**签名必须用同一个密钥库**，
 否则装不上（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`）；换密钥意味着必须卸载重装、丢数据。

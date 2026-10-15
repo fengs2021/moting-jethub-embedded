@@ -7,7 +7,7 @@
 #
 # 环境变量：
 #   JETHUB_UPSTREAM_APK  原始墨听 APK（必填）
-#   JETHUB_TOOLCHAIN     工具链目录（默认 ./toolchain）
+#   JETHUB_TOOLCHAIN     工具链目录（默认 ./toolchain，缺失自动自举）
 #   JETHUB_SMALI_TOOL    baksmali.jar（默认 $JETHUB_TOOLCHAIN/baksmali.jar）
 #
 # 用法：
@@ -17,12 +17,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-TOOLCHAIN="${JETHUB_TOOLCHAIN:-$ROOT/toolchain}"
-BAKSMALI="${JETHUB_SMALI_TOOL:-$TOOLCHAIN/baksmali.jar}"
 UPSTREAM="${JETHUB_UPSTREAM_APK:?请设置 JETHUB_UPSTREAM_APK 指向原始墨听 APK}"
 
+. "$ROOT/scripts/lib-deps.sh"
+ensure_deps "baksmali.jar"
+BAKSMALI="${JETHUB_SMALI_TOOL:-$TOOLCHAIN/baksmali.jar}"
+
 [ -f "$UPSTREAM" ] || { echo "原始 APK 不存在：$UPSTREAM" >&2; exit 1; }
-[ -f "$BAKSMALI" ] || { echo "缺少 $BAKSMALI（见 README「准备工具链」）" >&2; exit 1; }
 
 echo "== 1/2 列出 APK 内的 dex =="
 python3 - "$UPSTREAM" <<'EOF'
@@ -52,6 +53,7 @@ echo "  已生成 apk/smali4/（$(find apk/smali4 -name '*.smali' | wc -l) 个 s
 
 echo
 echo "准备完成。接下来："
-echo "  export ANDROID_BUILD_TOOLS=\$ANDROID_HOME/build-tools/34.0.0"
-echo "  export JETHUB_UPSTREAM_APK=$UPSTREAM"
-echo "  bash scripts/build.sh"
+echo "  JETHUB_UPSTREAM_APK=$UPSTREAM bash scripts/build.sh"
+echo
+echo "注意：scripts/build.sh 是增量调试用的轻量路线，它改不了 AndroidManifest、"
+echo "也插不进菜单入口，产出的包没有 JetHub 入口。要出成品请用 scripts/build-full.sh。"

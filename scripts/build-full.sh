@@ -47,32 +47,8 @@ OUT="${JETHUB_OUT:-墨听-4.0.20-jethub内置版.apk}"
 UPSTREAM="${JETHUB_UPSTREAM_APK:-}"
 
 # ---------------------------------------------------------------- 依赖自举
-need_deps=0
-for f in android-34.jar json.jar r8.jar baksmali.jar apktool.jar; do
-  [ -f "$TOOLCHAIN/$f" ] || need_deps=1
-done
-if [ -z "${ANDROID_BUILD_TOOLS:-}" ]; then
-  if [ -x "$SDK/build-tools/34.0.0/zipalign" ]; then
-    ANDROID_BUILD_TOOLS="$SDK/build-tools/34.0.0"
-  else
-    need_deps=1
-  fi
-fi
-export ANDROID_BUILD_TOOLS
-
-if [ "$need_deps" = 1 ] && [ -z "${JETHUB_SKIP_DEPS:-}" ]; then
-  echo "[0/9] 拉取并校验外部依赖（工具链 + Android SDK 片段）"
-  bash scripts/fetch-deps.sh
-  need_deps=0
-fi
-if [ "$need_deps" = 1 ]; then
-  echo "缺少依赖且已设 JETHUB_SKIP_DEPS=1，请先跑 scripts/fetch-deps.sh" >&2
-  exit 1
-fi
-: "${ANDROID_BUILD_TOOLS:?未能确定 build-tools 目录，请设置 ANDROID_BUILD_TOOLS}"
-for f in android-34.jar json.jar r8.jar baksmali.jar apktool.jar; do
-  [ -f "$TOOLCHAIN/$f" ] || { echo "缺少 $TOOLCHAIN/$f（跑 scripts/fetch-deps.sh）" >&2; exit 1; }
-done
+. "$ROOT/scripts/lib-deps.sh"
+ensure_deps "android-34.jar json.jar r8.jar baksmali.jar apktool.jar"
 
 mkdir -p build apk
 

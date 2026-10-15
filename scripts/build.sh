@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # JetHub 内置版墨听 — 轻量构建流水线（不跑 apktool 全量回编，直接替换 dex）
 #
-# 与 scripts/build-full.sh 的区别：
-#   build-full.sh  用 apktool 全量回编，能改 AndroidManifest、加资源、加新 smali 包，
-#                  但要求 apktool 能完整反编译原包（墨听是加固过的，这一步很脆）。
-#   build.sh（本脚本）  只做「换掉 classes4.dex + 追加 classes9.dex」，其余原样复制，
-#                  因此对原包加固/混淆的容忍度高得多，是实际发布用的那条路。
+# ⚠️ 这条路线**出不了可用的成品**，不要用它发布。
+#
+# 它只做「换掉 classes4.dex + 追加 classes9.dex」，改不了 AndroidManifest、也加不了
+# 新的 smali 包，因此**无法注册 JetHubActivity、无法往模型中心菜单插入口**。装出来的
+# 包里网关在后台跑着，但用户没有任何入口能点进去。
+#
+# 它的真正用途：在已经用 scripts/build-full.sh 全量回编过、且已打好补丁的反编译树上
+# 做增量调试 —— 改几行 Java 后只重编 dex，省掉几分钟的 apktool 回编时间。
+# 要出成品请用 scripts/build-full.sh。
 #
 # 流程：
 #   [1] javac 编译 src/jet/**
@@ -22,21 +26,26 @@
 #   JETHUB_SMALI_TOOL    smali.jar（默认 $JETHUB_TOOLCHAIN/smali.jar）
 #   JETHUB_KEYSTORE      签名密钥库（不提供则产出未签名 APK）
 #   JETHUB_KS_ALIAS / JETHUB_KS_PASS / JETHUB_KEY_PASS / JETHUB_OUT  同 build-full.sh
-#   ANDROID_BUILD_TOOLS  build-tools 目录（必填）
+#   ANDROID_BUILD_TOOLS  build-tools 目录（默认自举到 ./sdk/build-tools/34.0.0）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-TOOLCHAIN="${JETHUB_TOOLCHAIN:-$ROOT/toolchain}"
 SMALI_TREE="${JETHUB_SMALI_TREE:-$ROOT/apk/smali4}"
-SMALI_JAR="${JETHUB_SMALI_TOOL:-$TOOLCHAIN/smali.jar}"
 UPSTREAM="${JETHUB_UPSTREAM_APK:?请设置 JETHUB_UPSTREAM_APK 指向原始墨听 APK}"
 OUT="${JETHUB_OUT:-墨听-4.0.20-jethub内置版.apk}"
-: "${ANDROID_BUILD_TOOLS:?请设置 ANDROID_BUILD_TOOLS 指向 build-tools 目录}"
+
+. "$ROOT/scripts/lib-deps.sh"
+ensure_deps "android-34.jar json.jar r8.jar smali.jar"
+SMALI_JAR="${JETHUB_SMALI_TOOL:-$TOOLCHAIN/smali.jar}"
 
 [ -f "$UPSTREAM" ] || { echo "原始 APK 不存在：$UPSTREAM" >&2; exit 1; }
-[ -d "$SMALI_TREE" ] || { echo "smali 树不存在：$SMALI_TREE" >&2; exit 1; }
+[ -d "$SMALI_TREE" ] || {
+  echo "smali 树不存在：$SMALI_TREE" >&2
+  echo "  先用 scripts/prepare.sh 从上游 APK 里取 classes4 反编译出来。" >&2
+  exit 1
+}
 mkdir -p build apk/dexout
 
 echo "== 1/6 编译 Java =="

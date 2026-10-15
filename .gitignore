@@ -1,0 +1,43 @@
+# 构建产物
+build/
+apk/
+*.apk
+*.dex
+*.idsig
+
+# 工具链（自行下载，见 README）
+toolchain/
+
+# 反编译树与补丁中间产物
+full-decoded/
+manifest-only/
+res-only/
+smali/
+smali4/
+smali9/
+strings/
+work/
+
+# 密钥与凭据：绝不入库
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+keystore.properties
+local.properties
+.env
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# Python 缓存
+__pycache__/
+*.pyc

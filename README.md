@@ -108,20 +108,36 @@ docs/             里程碑日志
 | `android-34.jar` | [platform-34-ext7_r03.zip](https://dl.google.com/android/repository/platform-34-ext7_r03.zip) | javac 编译用的平台库 |
 
 GitHub 在国内是**间歇性可达**的：同一个 URL 这次能下、下次超时。所以 `fetch-deps.sh` 对
-GitHub 资源按「直连 → 镜像」顺序逐个尝试，任何一个成功即止：
+每个资源都按「直连 → 镜像」顺序逐个尝试，任何一个下完且哈希对即止：
 
 ```
-直连 → https://gh-proxy.com/ → https://ghproxy.net/ → https://ghfast.top/
+GitHub 资源：  直连 → https://gh-proxy.com/ → https://ghproxy.net/ → https://ghfast.top/
+dl.google.com：直连 → https://maven.aliyun.com/repository/google/（r8）
+                     → https://mirrors.cloud.tencent.com/AndroidSDK/（build-tools、platform）
+Maven Central：直连 → https://maven.aliyun.com/repository/public/（json）
 ```
 
-想换一组镜像就设 `JETHUB_GH_MIRRORS="https://a/ https://b/"`（空格分隔）。所有来源都过
-sha256 校验，镜像即使被投毒也进不来。Maven 与 dl.google.com 不走镜像。
+想换一组 GitHub 镜像就设 `JETHUB_GH_MIRRORS="https://a/ https://b/"`（空格分隔）。
+所有来源都过 sha256 校验，镜像即使被投毒也进不来；上面这些镜像的返回内容已逐个实测与
+官方哈希一致。
 
 若本机的 `HTTP_PROXY` 指向一个不通的代理，curl 会连不上，先
 `unset HTTP_PROXY HTTPS_PROXY ALL_PROXY`。
 
 `smali.jar` 标记为可选：只有轻量路线 `build.sh` 需要它，全量路线用不上，所以它下不下来
 都不会挡住出包。
+
+### 字符集
+
+源码、菜单文案、日志里都是中文，而 **javac 在没有 locale 的机器上默认按 US-ASCII 读源文件**，
+中文注释会炸出几万条 `unmappable character for encoding US-ASCII`，第一步编译就死。这种机器
+很常见：容器、CI、`ssh host cmd` 这类非交互 shell（`LANG` 为空、`LC_CTYPE=POSIX`）。
+
+所以脚本不指望环境正确，自己兜住：`scripts/lib-deps.sh` 在 source 时把 `LANG`/`LC_ALL` 顶到
+一个真实存在的 UTF-8 locale，并导出两个 JVM 参数变量——`JETHUB_JAVA_OPTS`
+（`-Dfile.encoding=UTF-8`，给 `java`）与 `JETHUB_JAVAC_OPTS`（`-J-Dfile.encoding=UTF-8`，给
+`javac`；javac 必须用 `-J` 前缀转发 JVM 参数，直接写 `-D` 会被当成 javac 自己的选项而报
+`invalid flag`）。各脚本的 `javac` 另带显式 `-encoding UTF-8`。想覆盖就自行设这两个变量。
 
 ### 一条命令出包
 
@@ -222,6 +238,8 @@ smali 中（`BuildConfig.APPLICATION_ID`、三个 provider authorities、取包�
 | `JETHUB_REDECODE` | 空 | 非空则强制重新解包 |
 | `JETHUB_SKIP_DEPS` | 空 | 非空则跳过依赖自举 |
 | `JETHUB_GH_MIRRORS` | 见上 | GitHub 加速镜像列表（空格分隔） |
+| `JETHUB_JAVA_OPTS` | `-Dfile.encoding=UTF-8` | 传给 `java` 的 JVM 参数 |
+| `JETHUB_JAVAC_OPTS` | `-J-Dfile.encoding=UTF-8` | 传给 `javac` 的 JVM 参数 |
 
 所有路径与口令都从环境变量读取，脚本里没有硬编码。**签名必须用同一个密钥库**，
 否则装不上（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`）；换密钥意味着必须卸载重装、丢数据。

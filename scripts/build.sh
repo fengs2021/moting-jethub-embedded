@@ -50,12 +50,13 @@ mkdir -p build apk/dexout
 
 echo "== 1/6 编译 Java =="
 rm -rf build/classes && mkdir -p build/classes
-javac -source 11 -target 11 -cp "$TOOLCHAIN/android-34.jar" -d build/classes \
+javac $JETHUB_JAVAC_OPTS -encoding UTF-8 -source 11 -target 11 \
+  -cp "$TOOLCHAIN/android-34.jar" -d build/classes \
   $(find src/jet -name '*.java')
 
 echo "== 2/6 d8 转 dex =="
 rm -f apk/dexout/classes9.dex
-java -Xmx2g -cp "$TOOLCHAIN/r8.jar" com.android.tools.r8.D8 --release \
+java $JETHUB_JAVA_OPTS -Xmx2g -cp "$TOOLCHAIN/r8.jar" com.android.tools.r8.D8 --release \
   --lib "$TOOLCHAIN/android-34.jar" --min-api 21 --output apk/dexout \
   $(find build/classes -name '*.class')
 mv apk/dexout/classes.dex apk/dexout/classes9.dex
@@ -78,7 +79,7 @@ print("injected")
 EOF
 
 echo "== 4/6 smali 回编 classes4 =="
-java -Xmx3g -jar "$SMALI_JAR" a --api 29 -o apk/dexout/classes4.new.dex "$SMALI_TREE"
+java $JETHUB_JAVA_OPTS -Xmx3g -jar "$SMALI_JAR" a --api 29 -o apk/dexout/classes4.new.dex "$SMALI_TREE"
 
 echo "== 5/6 重建 APK =="
 python3 - "$UPSTREAM" <<'EOF'

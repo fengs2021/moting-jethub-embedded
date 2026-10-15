@@ -45,7 +45,7 @@ print("  已取出 apk/classes4.dex")
 EOF
 
 rm -rf apk/smali4
-java -Xmx3g -jar "$BAKSMALI" d apk/classes4.dex -o apk/smali4
+java $JETHUB_JAVA_OPTS -Xmx3g -jar "$BAKSMALI" d apk/classes4.dex -o apk/smali4
 
 APP="apk/smali4/io/legado/app/App.smali"
 [ -f "$APP" ] || { echo "反汇编结果里没有 $APP —— classes4 的编号可能不是 4，请调整本脚本" >&2; exit 1; }

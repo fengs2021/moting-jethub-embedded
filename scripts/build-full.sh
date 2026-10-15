@@ -54,16 +54,18 @@ mkdir -p build apk
 
 echo "[1/9] 编译 jet.* 源码"
 rm -rf build/classes && mkdir -p build/classes
-javac -source 11 -target 11 -cp "$TOOLCHAIN/android-34.jar" -d build/classes \
+javac $JETHUB_JAVAC_OPTS -encoding UTF-8 -source 11 -target 11 \
+  -cp "$TOOLCHAIN/android-34.jar" -d build/classes \
   $(find src/jet -name '*.java')
 
 echo "[2/9] host 侧单测（模型注册表合并逻辑）"
 REGTEST="${JETHUB_REGTEST:-src/test/e2e/RegTest.java}"
 if [ -f "$REGTEST" ]; then
   mkdir -p build/test
-  javac -cp "$TOOLCHAIN/android-34.jar:$TOOLCHAIN/json.jar:build/classes" \
+  javac $JETHUB_JAVAC_OPTS -encoding UTF-8 \
+    -cp "$TOOLCHAIN/android-34.jar:$TOOLCHAIN/json.jar:build/classes" \
     -d build/test "$REGTEST"
-  java -cp "$TOOLCHAIN/json.jar:$TOOLCHAIN/android-34.jar:build/classes:build/test" RegTest | tail -1
+  java $JETHUB_JAVA_OPTS -cp "$TOOLCHAIN/json.jar:$TOOLCHAIN/android-34.jar:build/classes:build/test" RegTest | tail -1
 else
   echo "  （跳过：$REGTEST 不存在）"
 fi
@@ -75,7 +77,7 @@ else
   [ -n "$UPSTREAM" ] || { echo "反编译树不存在，且未设 JETHUB_UPSTREAM_APK" >&2; exit 1; }
   [ -f "$UPSTREAM" ] || { echo "原始 APK 不存在：$UPSTREAM" >&2; exit 1; }
   rm -rf "$DECODED"
-  java -jar "$TOOLCHAIN/apktool.jar" d -f --use-aapt2 -o "$DECODED" "$UPSTREAM" 2>&1 | tail -2
+  java $JETHUB_JAVA_OPTS -jar "$TOOLCHAIN/apktool.jar" d -f --use-aapt2 -o "$DECODED" "$UPSTREAM" 2>&1 | tail -2
 fi
 [ -f "$DECODED/AndroidManifest.xml" ] || { echo "$DECODED 不是有效的反编译树" >&2; exit 1; }
 
@@ -88,7 +90,7 @@ rm -rf build/dex build/smali9 && mkdir -p build/dex
 "$ANDROID_BUILD_TOOLS/d8" --release --min-api 29 \
   --lib "$TOOLCHAIN/android-34.jar" --output build/dex $(find build/classes/jet -name '*.class')
 rm -rf "$DECODED/smali_classes9"
-java -Xmx3g -jar "$BAKSMALI" d build/dex/classes.dex -o "$DECODED/smali_classes9"
+java $JETHUB_JAVA_OPTS -Xmx3g -jar "$BAKSMALI" d build/dex/classes.dex -o "$DECODED/smali_classes9"
 
 echo "[6/9] 打补丁（幂等：已打过则跳过）"
 # 顺序有意义：install_glue 先把胶水类放进 smali_classes10，
@@ -105,7 +107,7 @@ else
 fi
 
 echo "[8/9] apktool 回编整个 APK"
-java -jar "$TOOLCHAIN/apktool.jar" b -f --use-aapt2 "$DECODED" -o apk/built-full.apk 2>&1 | tail -1
+java $JETHUB_JAVA_OPTS -jar "$TOOLCHAIN/apktool.jar" b -f --use-aapt2 "$DECODED" -o apk/built-full.apk 2>&1 | tail -1
 
 echo "[9/9] zipalign + apksigner"
 "$ANDROID_BUILD_TOOLS/zipalign" -p -f 4 apk/built-full.apk apk/aligned-full.apk

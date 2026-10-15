@@ -52,15 +52,18 @@ java -Xmx2g -cp "$TOOLCHAIN/r8.jar" com.android.tools.r8.D8 --release \
 mv apk/dexout/classes.dex apk/dexout/classes9.dex
 
 echo "== 3/6 注入 App.onCreate（如未注入）=="
+# 锚点用正则：.registers N 与 .locals N 等价，具体写哪个随 apktool 参数而变。
+# 注入指令只用 p0，不改变寄存器分配，所以两种写法都能直接插。
 grep -q 'Ljet/android/Boot' "$SMALI_TREE/io/legado/app/App.smali" || python3 - "$SMALI_TREE" <<'EOF'
-import sys
+import re, sys
 p = sys.argv[1] + '/io/legado/app/App.smali'
 s = open(p, encoding='utf-8').read()
-anchor = ".method public onCreate()V\n    .registers 14\n"
-assert s.count(anchor) == 1, '锚点命中 %d 次' % s.count(anchor)
-s = s.replace(anchor, anchor +
+pat = re.compile(r'(\.method public onCreate\(\)V\n[ \t]+\.(?:registers|locals) \d+\n)')
+found = pat.findall(s)
+assert len(found) == 1, 'App.onCreate 锚点命中 %d 次（期望 1），请人工确认' % len(found)
+s = pat.sub(lambda m: m.group(1) +
   "\n    # JETHUB: 启动内嵌供应商网关（loopback，失败静默）\n"
-  "    invoke-static {p0}, Ljet/android/Boot;->init(Landroid/content/Context;)V\n")
+  "    invoke-static {p0}, Ljet/android/Boot;->init(Landroid/content/Context;)V\n", s, count=1)
 open(p, 'w', encoding='utf-8').write(s)
 print("injected")
 EOF

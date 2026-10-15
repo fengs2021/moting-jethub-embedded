@@ -8,8 +8,35 @@
 进去就是一个本机网关的管理页（账号、签到、模型、接入四个标签），在里面登录供应商、
 勾选模型，然后回到 AI 模型中心添加一个指向 `http://127.0.0.1:8391/v1` 的中转账号即可。
 
-> 本仓库只包含**改造工程本身**（Java 源码、smali 胶水、补丁脚本、构建流水线、管理页）。
-> 不含墨听原始 APK、不含任何私钥或真实凭据、不含构建产物。
+> 本仓库包含**完整的改造工程**：Java 源码、smali 胶水、补丁脚本、构建流水线、管理页前端。
+> 工具链与 Android SDK 片段由脚本从公开源自动下载并校验 sha256，无需手工准备。
+> 仓库不含墨听原始 APK、不含任何私钥或真实凭据、不含构建产物。
+
+---
+
+## 快速开始
+
+```bash
+git clone https://github.com/fengs2021/moting-jethub-embedded
+cd moting-jethub-embedded
+
+# 1) 拉取工具链与 Android SDK 片段（约 150 MB，逐字节校验 sha256）
+bash scripts/fetch-deps.sh
+
+# 2) 指向你自己的墨听原始 APK，一条命令出成品
+JETHUB_UPSTREAM_APK=/path/to/墨听.apk \
+JETHUB_KEYSTORE=/path/to/your.jks JETHUB_KS_PASS='***' \
+  bash scripts/build-full.sh
+```
+
+产物是 `墨听-4.0.20-jethub内置版.apk`。
+
+**唯一需要自备的输入是墨听原始 APK** —— 它是第三方软件，本仓库不重新分发。版本要求
+4.0.20-r2（`com.applecabal.njread`，versionCode 40023）。不提供 `JETHUB_KEYSTORE` 也能跑，
+但产出的是未签名包，只能本地验证、不能安装分发。
+
+前置条件只有三样：**JDK 11+**（`javac`）、**python3**、**curl/unzip**。apktool、d8、
+baksmali、zipalign、apksigner 全部由 `fetch-deps.sh` 备好，不需要预装 Android SDK。
 
 ---
 
@@ -32,8 +59,7 @@
   API Key 是管理页展示的本地密钥（运行时随机生成，非硬编码）。
 - 模型 id 形如 `cline/space-bunny-alpha`、`trae/...`、`buddy/...`、`workbuddy/...`、
   `minimax/...`，网关按前缀路由；同一个账号下可以同时开多家。
-- 供应商的 token 过期由 `RefreshScheduler` 在后台续期，凭据存 `CredentialStore`
-  （SharedPreferences + 本地加密），手机重启后依然有效。
+- 供应商的 token 过期由后台续期，凭据存 `CredentialStore`（App 私有目录），手机重启后依然有效。
 
 ## 当前进度
 
@@ -57,59 +83,74 @@ src/jet/core/     供应商适配器与网关核心（HttpFetcher、CredentialSt
                   GatewayServer、ModelRegistry、ModelCenterRegistrar、HomePage …）
 src/jet/android/  App 侧壳：Boot（进程启动时拉起网关）、JetHubActivity（管理页容器）
 src/test/         host JVM 上的端到端与回归测试（不依赖 Android 运行时）
+src/test/e2e/     真实凭据下的端到端验证脚本（RegTest / UiE2E / ModelMgmtTest …）
 smali-glue/       不能写成 Java 的 Compose 胶水（菜单文案 / 点击行为两个 smali 类）
 patches/          对墨听反编译树的补丁脚本（菜单注入、桌面图标移除、模型中心刷新、改包名）
-scripts/          构建流水线（prepare 取 dex；build 轻量替换 / build-full 全量 apktool 回编）
+scripts/          fetch-deps 拉依赖；build-full 全量出包；build 轻量路线；prepare 备输入
 assets/jethub/    管理页前端（单文件 HTML，无外部依赖）
 docs/             里程碑日志
 ```
 
-## 构建
+## 构建详解
 
-构建是**两段式**的：先把 Java 编译成 dex，再把它塞进墨听 APK。因为墨听的 APK 是加固过的，
-apktool 全量回编不一定成功，所以仓库提供了两条路：
+### 依赖自举
 
-- `scripts/build.sh` —— **轻量路线（实际发布用这条）**：只替换 `classes4.dex`、追加
-  `classes9.dex`，其余条目从原包原样复制。对加固/混淆的容忍度高。
-- `scripts/build-full.sh` —— **全量路线**：用 apktool 解包整个 APK，改 manifest、加资源、
-  加新的 smali 包，再整体回编。能做的事更多，但对原包更挑剔。
+`scripts/fetch-deps.sh` 把下面这些从公开源拉到 `toolchain/` 与 `sdk/`，每个都校验 sha256
+（哈希写在脚本里，版本刻意钉死）：
 
-### 准备工具链
+| 构件 | 来源 | 用途 |
+|---|---|---|
+| `apktool.jar` | [Apktool v2.9.3](https://github.com/iBotPeaches/Apktool/releases/tag/v2.9.3) | 解包 / 回编 APK（内置 linux aapt2，不依赖 SDK） |
+| `baksmali.jar` / `smali.jar` | [smali v2.5.2 fat jar](https://github.com/baksmali/smali/releases/tag/v2.5.2) | dex ↔ smali |
+| `r8.jar` | [Google Maven 8.2.33](https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.2.33/r8-8.2.33.jar) | d8：class → dex |
+| `json.jar` | [org.json 20240303](https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar) | host 侧单测 |
+| `build-tools/34.0.0` | [build-tools_r34-linux.zip](https://dl.google.com/android/repository/build-tools_r34-linux.zip) | d8 / zipalign / apksigner / aapt2 |
+| `android-34.jar` | [platform-34-ext7_r03.zip](https://dl.google.com/android/repository/platform-34-ext7_r03.zip) | javac 编译用的平台库 |
 
-`toolchain/` 需要四个 jar（仓库不含，自行下载）：
+若 GitHub 直连不畅，用 `JETHUB_GH_MIRROR=https://ghfast.top/` 指定加速前缀（只作用于
+GitHub 域名，Maven 与 dl.google.com 仍直连）。若本机的 `HTTP_PROXY` 指向一个不通的代理，
+先 `unset HTTP_PROXY HTTPS_PROXY ALL_PROXY`，否则 curl 会连不上。
 
-| 文件 | 来源 |
+### 一条命令出包
+
+```bash
+JETHUB_UPSTREAM_APK=/path/to/墨听.apk bash scripts/build-full.sh
+```
+
+`build-full.sh` 的九步：
+
+| 步骤 | 做什么 |
 |---|---|
-| `android-34.jar` | Android SDK `platforms/android-34/android.jar` |
-| `json.jar` | [org.json:json](https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar) |
-| `r8.jar` | [R8](https://maven.google.com/com.android.tools/r8/)（含 D8） |
-| `smali.jar` / `baksmali.jar` | [smali/baksmali](https://bitbucket.org/JesusFreke/smali/downloads/) |
+| 1 | `javac` 编译 `src/jet/**`（Java 11 目标） |
+| 2 | host 侧单测（模型注册表合并逻辑，不需要 Android 运行时） |
+| 3 | `apktool d` 解包上游 APK → `full-decoded/`（已存在则跳过，`JETHUB_REDECODE=1` 强制重解） |
+| 4 | 同步管理页 `assets/jethub/home.html` 进反编译树 |
+| 5 | `d8` 把 `jet/**` 打成 dex，再 `baksmali` 成 `smali_classes9/` |
+| 6 | 打补丁：胶水类 / manifest 注册 / 菜单注入 / Boot 注入 / 模型中心刷新（全部幂等） |
+| 7 | 改包名（可选，设了 `JETHUB_PACKAGE` 才做） |
+| 8 | `apktool b` 全量回编 |
+| 9 | `zipalign` + `apksigner` |
 
-另外需要：`javac`（JDK 11+）、`apktool`、`python3`，以及 Android SDK 的
-`build-tools`（提供 `zipalign` / `apksigner`）。
+为什么必须是**全量回编**这条路线：成品要在 `AndroidManifest.xml` 里注册
+`JetHubActivity`、在模型中心菜单里插一项、在 `App.onCreate()` 里注入一行启动网关。
+三者缺一，装出来的包就没有入口 —— 网关在后台跑着，但用户点不进去。
 
-### 准备构建输入
+`scripts/build.sh` 是另一条**轻量路线**（只替换 `classes4.dex`、追加 `classes9.dex`，
+其余条目从原包原样复制），对加固包的容忍度高，但它**只适用于反编译树已手工打好补丁的
+场景**，不能从零复现出带入口的成品。除非你在做增量调试，否则用 `build-full.sh`。
 
-轻量路线只需要 `classes4.dex` 的反汇编树（因为 JetHub 的注入点 `App.smali` 在 classes4 里）：
+### 补丁脚本
 
-```bash
-export JETHUB_UPSTREAM_APK=/path/to/墨听.apk
-bash scripts/prepare.sh        # 取出 classes4.dex → 反汇编成 apk/smali4/
-```
-
-全量路线要的是整个反编译树：
-
-```bash
-apktool d -f --use-aapt2 墨听.apk -o full-decoded
-```
-
-两个补丁脚本**不用手动跑** —— `build-full.sh` 的第 3d 步会调用它们，而且都是幂等的，
-重复执行只打印「跳过」。想单独跑也可以：
+`build-full.sh` 第 6 步会自动调用，且都幂等（重复跑只打印「跳过」）。单独跑也可以：
 
 ```bash
-JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-ui.py       # 胶水 + manifest + 菜单 + Boot 注入
+JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-ui.py       # 胶水 + manifest + 菜单 + Boot
 JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-refresh.py  # 返回模型中心时自动刷新
 ```
+
+两个脚本都接受反编译树路径作为第一个参数，缺省读环境变量 `JETHUB_DECODED`，再缺省
+`./full-decoded`。目标 smali 用 glob 在 `smali_classes*/` 下查找 —— 因为 apktool 的
+dex 分包编号随墨听版本变化，不能硬编码。
 
 `patches/patch-ui.py` 做四件事，都在脚本头部注释里写了原因：
 
@@ -119,10 +160,12 @@ JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-refresh.py  # 返回模�
 3. **在《管理网页转 API》下方插入《管理平台代理 API》** —— 菜单由 Compose 构建，
    注入点是 `MotingAiModelCenterScreenKt` 里 `AppDropdownMenuItem` 的那次调用；
    文案与点击行为来自 `smali-glue/` 的两个类。
-4. **往 `App.onCreate()` 注入 `Boot.init()`** —— 拉起内嵌网关。
+4. **往 `App.onCreate()` 注入 `Boot.init()`** —— 拉起内嵌网关。锚点用正则匹配
+   `.method public onCreate()V` 后跟 `.registers N` 或 `.locals N`，因为两种写法等价、
+   随 apktool 参数而变；注入指令只用 `p0`，不改变寄存器分配。
 
-`patches/patch-refresh.py` 解决的是用户实机反馈的问题：「写入 AI 模型中心后要刷新一下
-模型中心中的模型，要不然不会自动显示出来」。原因是模型中心的加载协程以
+`patches/patch-refresh.py` 解决的是实机反馈的问题：「写入 AI 模型中心后要刷新一下模型中心
+中的模型，要不然不会自动显示出来」。原因是模型中心的加载协程以
 `aiModelCenterBackupRevision` 作为 `LaunchedEffect` 的 key，只有「导入备份」那条路径会
 自增它，而 JetHub 写入走的是反射调 `restoreJson`，不经过那条路。补丁给
 `AiApiControlActivity` 加一个 `onResume()`，每次回到本页就把 revision +1。
@@ -137,8 +180,7 @@ JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-refresh.py  # 返回模�
 JETHUB_PACKAGE=com.example.moting python3 patches/patch-package.py full-decoded
 ```
 
-`build-full.sh` 的第 3e 步会读 `JETHUB_PACKAGE` 自动调用它；不设置就沿用上游包名
-（正式版用的是 `com.jethub.moting`）。
+`build-full.sh` 第 7 步会读 `JETHUB_PACKAGE` 自动调用它；不设置就沿用上游包名。
 
 包名不只在 `AndroidManifest.xml` 的 `package` 属性里，还以字符串形式散落在 9 个
 smali 中（`BuildConfig.APPLICATION_ID`、三个 provider authorities、取包名的工具类等）。
@@ -149,20 +191,21 @@ smali 中（`BuildConfig.APPLICATION_ID`、三个 provider authorities、取包�
 > 改名后是**另一个应用**：不会继承原版墨听的书架、阅读进度、AI 模型中心配置，
 > 需要重新初始化。这是 applicationId 的固有语义。
 
-### 编译与打包
+### 环境变量一览
 
-```bash
-export ANDROID_BUILD_TOOLS=$ANDROID_HOME/build-tools/34.0.0
-export JETHUB_UPSTREAM_APK=/path/to/墨听.apk
-export JETHUB_KEYSTORE=/path/to/your.jks JETHUB_KS_PASS=***   # 不给则产出未签名 APK
-
-bash scripts/prepare.sh        # 轻量路线需要：反汇编 classes4 → apk/smali4/
-bash scripts/build.sh          # 轻量路线（实际发布用这条）
-
-# 或者全量路线（需先 apktool 解包 + 跑两个补丁脚本）
-export JETHUB_DECODED=$PWD/full-decoded
-bash scripts/build-full.sh
-```
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `JETHUB_UPSTREAM_APK` | — | 墨听原始 APK（必填） |
+| `ANDROID_BUILD_TOOLS` | `./sdk/build-tools/34.0.0` | 含 zipalign/apksigner/d8 |
+| `JETHUB_TOOLCHAIN` | `./toolchain` | jar 目录 |
+| `JETHUB_SDK` | `./sdk` | SDK 片段目录 |
+| `JETHUB_DECODED` | `./full-decoded` | 反编译树 |
+| `JETHUB_KEYSTORE` / `JETHUB_KS_ALIAS` / `JETHUB_KS_PASS` / `JETHUB_KEY_PASS` | — / `jethub` / — / 同前 | 签名 |
+| `JETHUB_PACKAGE` | 空 | 改包名，空则沿用上游 |
+| `JETHUB_OUT` | `墨听-4.0.20-jethub内置版.apk` | 产物名 |
+| `JETHUB_REDECODE` | 空 | 非空则强制重新解包 |
+| `JETHUB_SKIP_DEPS` | 空 | 非空则跳过依赖自举 |
+| `JETHUB_GH_MIRROR` | 空 | GitHub 加速前缀 |
 
 所有路径与口令都从环境变量读取，脚本里没有硬编码。**签名必须用同一个密钥库**，
 否则装不上（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`）；换密钥意味着必须卸载重装、丢数据。
@@ -178,6 +221,8 @@ smali 放进对应 `smali_classesN/` 即可，`patch-ui.py` 会引用它们。
 本项目仅用于个人学习与自用，通过各家平台的**公开接口**访问**用户自己已付费/已授权的**
 账号。请遵守各平台的服务条款；因使用本项目产生的账号风险由使用者自负。
 仓库中不包含任何平台凭据、token 或私钥。
+
+墨听（Legado 衍生版）的著作权归其原作者所有；本仓库只分发改造工程，不重新分发原 APK。
 
 ## License
 

@@ -5,8 +5,11 @@
 #   [1] javac 编译 src/jet/**（Java 11 目标）
 #   [2] host 侧单测（合并/注册逻辑，不依赖 Android 运行时）
 #   [3] 同步管理页资源 assets/jethub/home.html 到反编译树
-#   [3b] d8 把 jet/** 打成 classes9.dex
-#   [4] baksmali 反编该 dex → smali_classes9，再 apktool b 回编整个 APK
+#   [3b] d8 把 jet/** 打成 classes9.dex，baksmali 反编成 smali_classes9
+#   [3c] 打补丁：Boot 注入 / 菜单注入 / 胶水类 / manifest 注册 Activity
+#        （patches/patch-ui.py 与 patches/patch-refresh.py，均幂等）
+#   [3d] 改包名（patches/patch-package.py，幂等；JETHUB_PACKAGE 置空可跳过）
+#   [4] apktool b 全量回编整个 APK
 #   [5] zipalign + apksigner 签名
 #   [6] 产出 墨听-4.0.20-jethub内置版.apk
 #
@@ -69,15 +72,28 @@ rm -rf build/dex && mkdir -p build/dex
 java -cp "$TOOLCHAIN/r8.jar" com.android.tools.r8.D8 --release --min-api 29 \
   --lib "$TOOLCHAIN/android-34.jar" --output build/dex $(find build/classes/jet -name '*.class')
 
-echo "[4/6] baksmali classes9 + apktool 回编整个 APK"
-if [ -f "$BAKSMALI" ]; then
-  rm -rf build/smali9 "$DECODED/smali_classes9"
-  java -jar "$BAKSMALI" d build/dex/classes.dex -o build/smali9
-  mv build/smali9 "$DECODED/smali_classes9"
+echo "[3c/6] baksmali → smali_classes9（apktool 回编需要 smali 源码而非 dex）"
+[ -f "$BAKSMALI" ] || { echo "缺少 $BAKSMALI（见 README「准备工具链」）" >&2; exit 1; }
+rm -rf build/smali9 "$DECODED/smali_classes9"
+java -Xmx3g -jar "$BAKSMALI" d build/dex/classes.dex -o build/smali9
+mv build/smali9 "$DECODED/smali_classes9"
+
+echo "[3d/6] 打补丁（幂等：已打过则跳过）"
+# 补丁脚本必须按顺序跑：install_glue 先把胶水类放进 smali_classes10，
+# patch_menu 才能在 MotingAiModelCenterScreenKt 里引用到它们。
+python3 patches/patch-ui.py "$DECODED"
+python3 patches/patch-refresh.py "$DECODED"
+
+echo "[3e/6] 改包名"
+# 默认不改：改名后是另一个应用，不继承原版墨听的数据，属于分发决策而非构建细节。
+# 要出对外分发的包就设 JETHUB_PACKAGE=com.example.moting（正式版用的是 com.jethub.moting）。
+if [ -n "${JETHUB_PACKAGE:-}" ]; then
+  python3 patches/patch-package.py "$DECODED" "$JETHUB_PACKAGE"
 else
-  # 没有 baksmali 时，直接把 dex 塞进 APK 也可行（apktool 不参与），见 scripts/build.sh
-  echo "  未找到 baksmali.jar，改用 dex 直塞模式" >&2
+  echo "  （跳过：未设置 JETHUB_PACKAGE，产出包名沿用上游的 com.applecabal.njread）"
 fi
+
+echo "[4/6] apktool 回编整个 APK"
 apktool b -f --use-aapt2 "$DECODED" -o apk/built-full.apk 2>&1 | tail -1
 
 echo "[5/6] zipalign + apksigner"

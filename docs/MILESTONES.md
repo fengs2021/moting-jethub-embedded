@@ -30,7 +30,7 @@
 - `src/test/` — Smoke / DeviceLoginTest / E2E / Chat2 / StreamTest / GwE2E（host 测试，classpath 加 `toolchain/json.jar`）
 - `apk/` — moting.apk、smali4（反汇编的 classes4，App.smali 已注入）、构建中间产物、签名 APK
 - `toolchain/` — r8.jar（d8）、android-34.jar、json.jar（仅 host 测试用）
-- `build.sh` — 一键构建流水线
+X
 
 ## 测试（host JVM）
 

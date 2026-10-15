@@ -58,8 +58,8 @@ src/jet/core/     供应商适配器与网关核心（HttpFetcher、CredentialSt
 src/jet/android/  App 侧壳：Boot（进程启动时拉起网关）、JetHubActivity（管理页容器）
 src/test/         host JVM 上的端到端与回归测试（不依赖 Android 运行时）
 smali-glue/       不能写成 Java 的 Compose 胶水（菜单文案 / 点击行为两个 smali 类）
-patches/          对墨听反编译树的补丁脚本（菜单注入、桌面图标移除、模型中心刷新）
-scripts/          构建流水线（两条：全量 apktool 回编 / 轻量 dex 替换）
+patches/          对墨听反编译树的补丁脚本（菜单注入、桌面图标移除、模型中心刷新、改包名）
+scripts/          构建流水线（prepare 取 dex；build 轻量替换 / build-full 全量 apktool 回编）
 assets/jethub/    管理页前端（单文件 HTML，无外部依赖）
 docs/             里程碑日志
 ```
@@ -88,21 +88,38 @@ apktool 全量回编不一定成功，所以仓库提供了两条路：
 另外需要：`javac`（JDK 11+）、`apktool`、`python3`，以及 Android SDK 的
 `build-tools`（提供 `zipalign` / `apksigner`）。
 
-### 准备反编译树
+### 准备构建输入
+
+轻量路线只需要 `classes4.dex` 的反汇编树（因为 JetHub 的注入点 `App.smali` 在 classes4 里）：
+
+```bash
+export JETHUB_UPSTREAM_APK=/path/to/墨听.apk
+bash scripts/prepare.sh        # 取出 classes4.dex → 反汇编成 apk/smali4/
+```
+
+全量路线要的是整个反编译树：
 
 ```bash
 apktool d -f --use-aapt2 墨听.apk -o full-decoded
-JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-ui.py       # 菜单项 + 去掉桌面图标
+```
+
+两个补丁脚本**不用手动跑** —— `build-full.sh` 的第 3d 步会调用它们，而且都是幂等的，
+重复执行只打印「跳过」。想单独跑也可以：
+
+```bash
+JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-ui.py       # 胶水 + manifest + 菜单 + Boot 注入
 JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-refresh.py  # 返回模型中心时自动刷新
 ```
 
-`patches/patch-ui.py` 做两件事，都在脚本头部注释里写了原因：
+`patches/patch-ui.py` 做四件事，都在脚本头部注释里写了原因：
 
-1. **移除 JetHubActivity 的 LAUNCHER intent-filter** —— 入口应该在墨听自己的
-   《AI 模型与接口中心》里，桌面上再放一个图标是重复的。
-2. **在《管理网页转 API》下方插入《管理平台代理 API》** —— 菜单由 Compose 构建，
+1. **放胶水类** —— 把 `smali-glue/` 下的两个 smali 拷进 `smali_classes10/`。
+2. **注册 JetHubActivity 并去掉 LAUNCHER** —— 上游原包里没有这个 Activity，所以要先注册；
+   入口应该在墨听自己的《AI 模型与接口中心》里，桌面上再放一个图标是重复的。
+3. **在《管理网页转 API》下方插入《管理平台代理 API》** —— 菜单由 Compose 构建，
    注入点是 `MotingAiModelCenterScreenKt` 里 `AppDropdownMenuItem` 的那次调用；
    文案与点击行为来自 `smali-glue/` 的两个类。
+4. **往 `App.onCreate()` 注入 `Boot.init()`** —— 拉起内嵌网关。
 
 `patches/patch-refresh.py` 解决的是用户实机反馈的问题：「写入 AI 模型中心后要刷新一下
 模型中心中的模型，要不然不会自动显示出来」。原因是模型中心的加载协程以
@@ -110,15 +127,41 @@ JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-refresh.py  # 返回模�
 自增它，而 JetHub 写入走的是反射调 `restoreJson`，不经过那条路。补丁给
 `AiApiControlActivity` 加一个 `onResume()`，每次回到本页就把 revision +1。
 
+### 改包名（可选）
+
+上游墨听的 applicationId 是 `com.applecabal.njread`。改造版如果沿用同一个包名，
+装到手机上会与原版墨听共用数据目录与签名身份——两个版本无法并存，签名不一致时
+覆盖安装还会直接失败。要对外分发就换掉：
+
+```bash
+JETHUB_PACKAGE=com.example.moting python3 patches/patch-package.py full-decoded
+```
+
+`build-full.sh` 的第 3e 步会读 `JETHUB_PACKAGE` 自动调用它；不设置就沿用上游包名
+（正式版用的是 `com.jethub.moting`）。
+
+包名不只在 `AndroidManifest.xml` 的 `package` 属性里，还以字符串形式散落在 9 个
+smali 中（`BuildConfig.APPLICATION_ID`、三个 provider authorities、取包名的工具类等）。
+逐处枚举容易漏，所以脚本做的是全树字符串替换——`com.applecabal.njread` 这个字面量
+在 apktool 解包出的树里只可能是包名本身，不会误伤类描述符。上游 4.0.20-r2 实测命中
+16 处 / 9 个文件。
+
+> 改名后是**另一个应用**：不会继承原版墨听的书架、阅读进度、AI 模型中心配置，
+> 需要重新初始化。这是 applicationId 的固有语义。
+
 ### 编译与打包
 
 ```bash
 export ANDROID_BUILD_TOOLS=$ANDROID_HOME/build-tools/34.0.0
-export JETHUB_DECODED=$PWD/full-decoded
 export JETHUB_UPSTREAM_APK=/path/to/墨听.apk
 export JETHUB_KEYSTORE=/path/to/your.jks JETHUB_KS_PASS=***   # 不给则产出未签名 APK
 
-bash scripts/build-full.sh     # 或 scripts/build.sh
+bash scripts/prepare.sh        # 轻量路线需要：反汇编 classes4 → apk/smali4/
+bash scripts/build.sh          # 轻量路线（实际发布用这条）
+
+# 或者全量路线（需先 apktool 解包 + 跑两个补丁脚本）
+export JETHUB_DECODED=$PWD/full-decoded
+bash scripts/build-full.sh
 ```
 
 所有路径与口令都从环境变量读取，脚本里没有硬编码。**签名必须用同一个密钥库**，

@@ -21,3 +21,9 @@ upstream-*/
 *.p12
 *.pem
 *.key
+
+# 本地临时文件（提交信息草稿、一次性调试脚本）
+.commit-msg.txt
+.rebuild*.sh
+.oc*.sh
+.oc*.py

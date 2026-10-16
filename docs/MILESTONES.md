@@ -643,10 +643,16 @@ free_usage_limit → go_usage_limit → free_tier（不重试不换槽）
 | 项 | 值 |
 |---|---|
 | 文件 | `墨听-4.0.20-r2-jethub内置版.apk` |
-| 大小 | 70603414 字节 |
-| sha256 | `05adeb3bf67f7a50224d427e5f9802b0c4e1b0187efb5ce3696e8ca18f6071fc` |
+| 大小 | 70603414 字节（两次独立构建完全一致） |
+| sha256 | `d78fc3d7f5b20cea5dec4315987e1329aeea40d42c6a46c2f4a02cabb4588a1d`（冷构建） |
 | dex 分包 | `classes.dex` … `classes10.dex`，编号 1..10 连续 |
 | 关键类落位 | `jet/core/OpencodeProvider.smali`（31 个方法）、`AccountManager$OpencodeIdentity.smali` → `classes9.dex` |
 | 包身份 | `com.jethub.moting` / versionCode 40023 / versionName 4.0.20-r2 / targetSdk 34 |
 | 应用名 | 墨听JetHub |
 | 签名 | CN=JetHub Embedded, OU=Dev, O=JetHub, C=CN，SHA-256 `3f0e1b4d…5e15f73` |
+
+> ⚠️ **sha256 每次构建都不同，大小完全相同**（热构建 `05adeb3b…` vs 冷构建 `d78fc3d7…`）。
+> 原因：`apktool` 回编时按 NTFS 目录遍历顺序写 dex，dex 内部条目布局随之重排。
+> 故**不能用 sha256 做构建一致性判据**——判据是字节大小 + `tools/verify-apk.sh` 的结构检查。
+> 这也解释了为什么早期用 `unzip -v` 取 CRC 与 Python `zipfile`+sha256 比对会得出
+> 自相矛盾的结论（11 处差异 vs 3 处）：前者读的 `META-INF/MANIFEST.MF` 摘要本身就在变。

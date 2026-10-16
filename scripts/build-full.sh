@@ -133,6 +133,10 @@ python3 patches/patch-refresh.py "$DECODED"
 # "canonical units overlap or are out of order" 而永远标注不出来。
 # 详见 docs/OVERLAP-FIX.md。
 python3 patches/patch-overlap.py "$DECODED"
+# 音频漫画配图：把 deliver() 里「图片未就绪就抛未捕获异常」改成走错误回调。
+# 不改这一处，一张过小/写坏的图片会穿透到协程，把整章配图流水线取消
+# （IllegalArgumentException: audio comic image is not stable）。
+python3 patches/patch-audiocomic.py "$DECODED"
 
 echo "[7/9] 改包名 / 改应用显示名"
 # 默认不改：改名后是另一个应用，不继承原版墨听的数据，属于分发决策而非构建细节。

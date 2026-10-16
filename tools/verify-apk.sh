@@ -147,6 +147,26 @@ else
   else
     bad "patch-overlap 未生效（缺 JetHubCanonicalClamp）"
   fi
+  # patch-audiocomic 的效果：deliver() 里「图片未就绪」不再抛未捕获异常，改为走
+  # p7 错误回调。判据有两条，缺一不可：
+  #   1) 旧的 throw 助手类（Lokio/CipherSink$$ExternalSyntheticBUOutline0;->m(String,Object)V）
+  #      在该文件里彻底消失——它只被这一处抛错路径使用；
+  #   2) 新路径把异常构造出来并交给 p7。
+  # 不做这一条检查的话，一张过小/写坏的图片会穿透到协程、取消整章配图流水线
+  # （IllegalArgumentException: audio comic image is not stable）。
+  acl="$(find "$W" -path '*help/audiobook/AudioComicImageDeliveryFastLane.smali' 2>/dev/null | head -1)"
+  if [ -n "$acl" ]; then
+    if grep -qF 'Lokio/CipherSink$$ExternalSyntheticBUOutline0;->m(Ljava/lang/String;Ljava/lang/Object;)V' "$acl"; then
+      bad "patch-audiocomic 未生效（deliver 仍抛未捕获异常）"
+    elif grep -qF 'invoke-interface {p7, p1}, Lkotlin/jvm/functions/Function1;->invoke(Ljava/lang/Object;)Ljava/lang/Object;' "$acl" \
+      && grep -qF 'new-instance p1, Ljava/lang/IllegalArgumentException;' "$acl"; then
+      ok "patch-audiocomic 生效（图片未就绪改走 p7 错误回调，不再取消整章流水线）"
+    else
+      bad "patch-audiocomic 半生效（旧抛错已去除但新回调缺失）"
+    fi
+  else
+    bad "找不到 AudioComicImageDeliveryFastLane.smali"
+  fi
 fi
 
 echo

@@ -154,7 +154,7 @@ src/test/         host JVM 上的端到端与回归测试（不依赖 Android �
 src/test/e2e/     真实凭据下的端到端验证脚本（RegTest / UiE2E / ModelMgmtTest …）
 smali-glue/       不能写成 Java 的 Compose 胶水（菜单文案 / 点击行为两个 smali 类）
 patches/          对墨听反编译树的补丁脚本（菜单注入、桌面图标移除、模型中心刷新、
-                  预标注区间收敛、改包名、改应用显示名）
+                  预标注区间收敛、音频漫画配图健壮性、改包名、改应用显示名）
 tools/            验证工具（verify_clamp.py：自写 Dalvik 解释器 + 参考实现对照；
                   verify-apk.sh：成品包验收，dex 分包连续性 / 关键类落位 / 入口三要素 / 签名）
 tests/art/        真机 ART 验证（把补丁的 smali 丢给真实 ART 执行，替代人眼审查）
@@ -244,7 +244,7 @@ bash scripts/build-full.sh
 | 3 | `apktool d` 解包上游 APK → `full-decoded/`（已存在则跳过，`JETHUB_REDECODE=1` 强制重解） |
 | 4 | 同步管理页 `assets/jethub/home.html` 进反编译树 |
 | 5 | `d8` 把 `jet/**` 打成 dex，再 `baksmali` 成下一个空闲分包（现有最大编号 +1，见上） |
-| 6 | 打补丁：胶水类 / manifest 注册 / 菜单注入 / Boot 注入 / 模型中心刷新（全部幂等） |
+| 6 | 打补丁：胶水类 / manifest 注册 / 菜单注入 / Boot 注入 / 模型中心刷新 / 预标注区间收敛 / 音频漫画配图健壮性（全部幂等） |
 | 7 | 改包名（可选，设了 `JETHUB_PACKAGE` 才做）+ 改应用显示名（默认「墨听JetHub」） |
 | 8 | `apktool b` 全量回编 |
 | 9 | `zipalign` + `apksigner` |
@@ -269,12 +269,14 @@ bash scripts/build-full.sh
 JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-ui.py       # 胶水 + manifest + 菜单 + Boot
 JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-refresh.py  # 返回模型中心时自动刷新
 python3 patches/patch-overlap.py full-decoded                      # 预标注区间收敛
+python3 patches/patch-audiocomic.py full-decoded                   # 音频漫画图片未就绪不再崩
 python3 patches/patch-label.py full-decoded                        # 应用显示名 墨听 → 墨听JetHub
 ```
 
-三个脚本都接受反编译树路径作为第一个参数，缺省读环境变量 `JETHUB_DECODED`，再缺省
+每个脚本都接受反编译树路径作为第一个参数，缺省读环境变量 `JETHUB_DECODED`，再缺省
 `./full-decoded`。目标 smali 用 glob 在 `smali_classes*/` 下查找 —— 因为 apktool 的
-dex 分包编号随墨听版本变化，不能硬编码。`patch-overlap.py` 另支持 `--check` 只校验不写。
+dex 分包编号随墨听版本变化，不能硬编码。`patch-overlap.py` 与 `patch-audiocomic.py`
+另支持 `--check` 只校验不写。
 
 `patches/patch-ui.py` 做四件事，都在脚本头部注释里写了原因：
 
@@ -320,6 +322,29 @@ bash tests/art/run-art-test.sh           # 真实 Android ART 执行补丁的 sm
 bash tools/verify-apk.sh                 # 成品包验收（见下）
 ```
 
+`patches/patch-audiocomic.py` 修的是实机崩溃「音频漫画配图到某一格时整章停摆」：
+
+```
+java.lang.IllegalArgumentException: audio comic image is not stable:
+  /storage/emulated/0/Android/data/com.jethub.moting/files/audio-comic/images/…/xxx.jpg
+    at okio.CipherSink$$ExternalSyntheticBUOutline0.m(SourceFile:0)
+    at …AudioComicImageDeliveryFastLane.deliver(SourceFile:25)
+    at …AudioComicImageGenerationWorker.generatePlanSnapshot$handleSceneOutcome(SourceFile:2653)
+    at …AudioComicImageLanePipeline$run$3.invokeSuspend(SourceFile:72)
+  Suppressed: DiagnosticCoroutineContextException: [LazyStandaloneCoroutine{Cancelling}]
+```
+
+`deliver()` 对「图片不是文件、或长度 < 1024 字节」这种情况**直接抛异常**，而唯一调用方
+`generatePlanSnapshot$handleSceneOutcome` 的 `try/catch` 只捕获
+`ApiWorkerPlanWriteRejectedException` —— 于是异常穿透到协程，把**整章**的配图流水线取消，
+而不是只让这一格失败。补丁把该分支改成「构造同样的异常并交给 `p7` 错误回调」，失败被限定
+在单格、走 App 自己的错误日志路径，其余分镜照常出图。
+
+> 这是上游的健壮性缺陷，不是本项目引入的：`audio comic image is not stable` 这个字符串在
+> 上游 r2 原包里同样存在（`grep` 可验）。补丁只做「不崩」，**不做重试等待**——长度 < 1024
+> 通常是模型侧返回了错误体（HTTP 200 但 body 是 JSON 错误串），不是「文件还在写」的竞态：
+> 写入侧 `downloadImageToFile` 用一次 `writeBytes` 落盘，`deliver` 是在同一协程里紧随其后调用的。
+
 ### 成品包验收
 
 出包之后、装机之前，跑一次：
@@ -338,7 +363,8 @@ bash tools/verify-apk.sh apk/built-full.apk       # 或指定路径
    `NoClassDefFoundError: Failed resolution of: Ljet/android/Boot;` 闪退 ——
    而回编、签名、产物结构检查全都正常，**只有装到机器上才炸**。所以 `build-full.sh`
    取的是「现有最大编号 +1」（`jethub_next_dex_slot`），验收工具再复核一遍。
-2. **关键类落位**（`Boot` / `JetHubActivity` / 两个胶水类 / `JetHubCanonicalClamp`）。
+2. **关键类落位**（`Boot` / `JetHubActivity` / 两个胶水类 / `JetHubCanonicalClamp`）
+   与**各补丁的真实效果**（`onResume` 已注入、区间收敛类已被调用、`deliver` 不再抛未捕获异常）。
 3. **入口三要素**：Manifest 注册了 `JetHubActivity`、`assets/jethub/home.html` 已打入、
    `App.onCreate()` 注入了 `Boot.init()`。三者缺一则装出的包没有入口（网关在跑但点不进去）。
 4. **包身份与签名证书**。

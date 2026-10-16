@@ -110,6 +110,12 @@ Compose 生成的 lambda id，而不是靠行号。
 
 细节与踩坑记录见 [`docs/MILESTONES.md`](docs/MILESTONES.md)。
 
+### 已修复的上游缺陷
+
+| 问题 | 现象 | 记录 |
+|---|---|---|
+| 个别章节预标注每轮必失败 | 第 250/251 章报 `canonical units overlap or are out of order`，永远标注不出来 | [`docs/OVERLAP-FIX.md`](docs/OVERLAP-FIX.md) |
+
 ## 目录结构
 
 ```
@@ -120,10 +126,13 @@ src/jet/android/  App 侧壳：Boot（进程启动时拉起网关）、JetHubAct
 src/test/         host JVM 上的端到端与回归测试（不依赖 Android 运行时）
 src/test/e2e/     真实凭据下的端到端验证脚本（RegTest / UiE2E / ModelMgmtTest …）
 smali-glue/       不能写成 Java 的 Compose 胶水（菜单文案 / 点击行为两个 smali 类）
-patches/          对墨听反编译树的补丁脚本（菜单注入、桌面图标移除、模型中心刷新、改包名）
+patches/          对墨听反编译树的补丁脚本（菜单注入、桌面图标移除、模型中心刷新、
+                  预标注区间收敛、改包名）
+tools/            验证工具（verify_clamp.py：自写 Dalvik 解释器 + 参考实现对照）
+tests/art/        真机 ART 验证（把补丁的 smali 丢给真实 ART 执行，替代人眼审查）
 scripts/          fetch-deps 拉依赖；build-full 全量出包；build 轻量路线；prepare 备输入
 assets/jethub/    管理页前端（单文件 HTML，无外部依赖）
-docs/             里程碑日志
+docs/             里程碑日志 + 单点修复的详细记录（如 OVERLAP-FIX.md）
 ```
 
 ## 构建详解
@@ -231,11 +240,12 @@ bash scripts/build-full.sh
 ```bash
 JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-ui.py       # 胶水 + manifest + 菜单 + Boot
 JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-refresh.py  # 返回模型中心时自动刷新
+python3 patches/patch-overlap.py full-decoded                      # 预标注区间收敛
 ```
 
-两个脚本都接受反编译树路径作为第一个参数，缺省读环境变量 `JETHUB_DECODED`，再缺省
+三个脚本都接受反编译树路径作为第一个参数，缺省读环境变量 `JETHUB_DECODED`，再缺省
 `./full-decoded`。目标 smali 用 glob 在 `smali_classes*/` 下查找 —— 因为 apktool 的
-dex 分包编号随墨听版本变化，不能硬编码。
+dex 分包编号随墨听版本变化，不能硬编码。`patch-overlap.py` 另支持 `--check` 只校验不写。
 
 `patches/patch-ui.py` 做四件事，都在脚本头部注释里写了原因：
 
@@ -264,6 +274,25 @@ dex 分包编号随墨听版本变化，不能硬编码。
 `aiModelCenterBackupRevision` 作为 `LaunchedEffect` 的 key，只有「导入备份」那条路径会
 自增它，而 JetHub 写入走的是反射调 `restoreJson`，不经过那条路。补丁给
 `AiApiControlActivity` 加一个 `onResume()`，每次回到本页就把 revision +1。
+
+`patches/patch-overlap.py` 修的是「个别章节后台预标注**每轮必报**
+`canonical units overlap or are out of order`、永远标注不出来」。根因在
+`enrich` 的重叠自检失败后走**回滚分支**，而回滚返回的是未排序、未做引号区间减法的原始
+行表，于是旁白行与其内嵌对白行的区间重叠，穿透到 `CanonicalChapterUnitStore.exactUnitRecords`
+的 `rawStart < previousEnd` 判据。补丁在构造 `ExactUnit` 前对相邻单元做**区间单调收敛**
+（裁剪，保持 `text == chapterText.substring(rawStart, rawEnd)` 不变式）。
+
+完整定位过程、失败链、寄存器约束与三层验证记录见
+[`docs/OVERLAP-FIX.md`](docs/OVERLAP-FIX.md)。验证方式：
+
+```bash
+python3 tools/verify_clamp.py            # 自写 Dalvik 解释器 + 参考实现对照（10+5+12 项）
+bash tests/art/run-art-test.sh           # 真实 Android ART 执行补丁的 smali（8 个用例）
+```
+
+> 为什么值得单独写个解释器和真机测试：这个补丁的 `if-ge`/`if-gt` 方向在编写过程中被写反过
+> 多次，而 `smali.jar assemble` **只检查语法不检查语义**——每次都「编译通过」。人眼审查在
+> 条件跳转极性上已被证明不可靠。
 
 ### 改包名（可选）
 

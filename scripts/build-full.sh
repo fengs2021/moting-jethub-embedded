@@ -11,7 +11,8 @@
 #   [3] 解包上游墨听 APK → $DECODED（已存在则跳过；JETHUB_REDECODE=1 强制重解）
 #   [4] 同步管理页 assets/jethub/home.html 到反编译树
 #   [5] d8 把 jet/** 打成 dex，baksmali 成 smali_classes9
-#   [6] 打补丁（幂等）：胶水类 / manifest 注册 / 菜单注入 / Boot 注入 / 刷新补丁
+#   [6] 打补丁（幂等）：胶水类 / manifest 注册 / 菜单注入 / Boot 注入 / 刷新补丁 /
+#       预标注区间收敛（canonical units overlap 修复）
 #   [7] 改包名（可选，JETHUB_PACKAGE）
 #   [8] apktool b 全量回编
 #   [9] zipalign + apksigner
@@ -116,6 +117,11 @@ echo "[6/9] 打补丁（幂等：已打过则跳过）"
 # patch_menu 才能在 MotingAiModelCenterScreenKt 里引用到它们。
 python3 patches/patch-ui.py "$DECODED"
 python3 patches/patch-refresh.py "$DECODED"
+# 预标注「canonical units overlap」修复：在 ExactUnit 构造循环里对相邻单元做区间
+# 单调收敛。不改这一处，个别章节（如第 250/251 章）会每轮都报
+# "canonical units overlap or are out of order" 而永远标注不出来。
+# 详见 docs/OVERLAP-FIX.md。
+python3 patches/patch-overlap.py "$DECODED"
 
 echo "[7/9] 改包名"
 # 默认不改：改名后是另一个应用，不继承原版墨听的数据，属于分发决策而非构建细节。

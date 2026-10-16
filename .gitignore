@@ -1,6 +1,7 @@
 # 构建产物
 build/
 apk/
+full-decoded
 full-decoded/
 smali*/
 __pycache__/

@@ -416,3 +416,106 @@ grep -rn "111\.229\.221\.200|jetgw|8326|8327" src/ assets/jethub/home.html
 ```
 
 所有上游请求由内嵌内核直连各供应商官方域名；墨听侧只连 `127.0.0.1:<port>`。
+
+## 里程碑 12：修「个别章节预标注每轮必报 canonical units overlap」
+
+对应反馈：「有 2 个章节标注始终报错，帮忙分析和解决下。」
+
+### ① 现象与判据
+
+第 250 章「第七十一章 心意」与第 251 章「第七十二章 朋友」后台预标注**每一轮**都停在
+【角色记忆读取】之后，永远走不到 `【QUOTE_CLASSIFY】` / `【本地初筛】`：
+
+```
+canonical units overlap or are out of order: sequence=81 start=1961 previousEnd=1971   （第 250 章）
+canonical units overlap or are out of order: sequence=88 start=1594 previousEnd=1595   （第 251 章）
+```
+
+5 轮重试全部复现同一断点 → 确定性算法缺陷，与模型 / 网络 / 角色记忆无关。
+
+日志按章对照后否掉了两个直觉候选：`crossParagraph=1` 也出现在成功的第 246/248 章，
+**不是区分因子**；`LONG_QUOTE blocks` 第 250 章是 53（完全正常），第 251 章 85（全场最高）
+但也不是根因。全部章节 `unclosed=0 syntheticClose=0`。
+
+### ② 定位：唯一抛错点
+
+```
+CanonicalChapterUnitStore.exactUnitRecords(String chapterText, List<ExactUnit>)   :2378
+  .line 1208  getRawStart() → v2
+              if-lt v2, v15, :cond_10     # v15 = previousEnd，初值 -1
+  .line 1226  v15 = getRawEnd()           # 唯一的 previousEnd 更新点
+```
+
+同循环还要求 `text == chapterText.substring(rawStart, rawEnd)`。
+报错由 `CanonicalChapterUnitStore$$ExternalSyntheticBUOutline0;->m` 拼串后抛 `IllegalArgumentException`。
+
+### ③ 根因：enrich 的回滚分支丢了排序与区间减法
+
+`enrichTimbreLinesWithQuoteDialogueBlocks$app`（`RoleTimbrePrelabel.smali:34044`）末尾有三个
+自检旗标（`:35976-35982`）：`v2=invalidExact`、`v3=invalidCoverage`、`v4=overlapPair`。
+任一成立即 `goto :goto_2b` 走**回滚分支**（`:36253-36446`）：
+
+```
+.line 1502  new QuoteDialogueEnrichment(p3, emptyMap(), 0)
+            ^^^ p3 = enrich 的入参 base lines
+```
+
+正常路径（`:cond_33`）返回的是 `.line 1447` `sortedWith` 排序后、且做过
+`subtractQuoteRawRanges` 引号区间减法的结果。**回滚路径返回未排序、未做减法的原始 base lines**
+→ 旁白行的区间没有把内嵌对话区间挖掉 → 旁白行与其内部对白行区间重叠 → 穿透到
+`exactUnitRecords` 的 `.line 1208`。
+
+回滚只写 `Log.i` / `Log.w`（进 logcat），**不进预标注日志文件**——所以日志里 grep
+`invalidExact` / `rollback` 全空，最初因此误判成「模型调用阶段的问题」。
+
+### ④ 补丁落点：ExactUnit 构造循环
+
+候选落点逐个排除：
+
+| 候选 | 排除理由 |
+|---|---|
+| `exactUnitRecords` 本身 | 改它等于放宽校验，掩盖问题 |
+| `normalize` | 不排序不去重；`ScriptBrain$Analysis` 只有 `chapterTextHash`、**没有 `chapterText` 字段**，拿不到正文无法重切片 |
+| `enrich` 回滚分支 | 该分支只有 base lines，同样没有 `chapterText` |
+| **`prepareTimbreV895PrelabelChapter$app` 的 ExactUnit 构造循环** | ✅ 最后一个同时握有 `chapterText`（`v7`，`:39164`）与最终偏移（`v26/v27/v28`）的地方 |
+
+`materializeInitialIn` 对首单元有五连断言（必须是章节标题行：`rawStart=0` / `rawEnd=标题长` /
+`text=标题` / `partIndex=0` / `entrySeq=0`），所以**不能删改首单元**，只能收敛区间。
+收敛保持两个不变式：`rawStart >= previousEnd` 且 `text == chapterText.substring(rawStart, rawEnd)`。
+
+### ⑤ 实现：新增静态辅助类 + 宽寄存器调用
+
+`v1..v11` 是 `:39311 materializeInitial$app` 的实参，循环内**一个都不能碰**；而
+`if-*`（22t）/ `invoke-*`（35c）/ `const/4`（11n）的寄存器字段只有 4 位，只能寻址 `v0..v15`。
+于是把窄寄存器运算全部下沉到新增静态类 `JetHubCanonicalClamp`（自己的 `.locals` 独立），
+调用方只用 `invoke-static/range {v41 .. v45}` 传参、`invoke-virtual/range {v47 .. v47}` 取回
+（`v41..v47` 在循环区间 `:39196-39311` 内全部空闲）。
+
+补丁后 `RoleTimbrePrelabel.smali` 45748 → 45780 行（+985 字节），辅助类 2659 字节。
+
+### ⑥ 教训：语法合法 ≠ 语义正确
+
+这个补丁的 `if-ge` / `if-gt` / `if-ltz` 方向在编写过程中被写反过**多次**，而
+`smali.jar assemble` **只检查语法不检查语义**——每次都「编译通过」（exit 0，产出正常 dex）。
+人眼审查在条件跳转极性上已被证明不可靠。因此建了两层机器验证：
+
+- `tools/verify_clamp.py`：自写小型 Dalvik 解释器执行补丁的**真实 smali**，与独立写的
+  参考实现对照（A 段 10 个边界用例 / B 段 5 个跨迭代不变式 / C 段 12 项调用协议）。
+  这个验证器自己也栽过：最初把 `if-gez` / `if-lez` 的真值表写反（`gez` = **greater-or-equal**，
+  不是「小于等于」），导致 10 个用例全 FAIL，还让我按错的表去「修」补丁、越修越偏。
+- `tests/art/`：把测试壳 + 辅助类 + `PlaybackTextUnitContract$Part` 一起 assemble 成 dex，
+  `adb push` 后用真实 Android ART（`dalvikvm`）执行。**测试壳里一条条件跳转都不写**——只打印
+  `caseN start=.. end=.. len=.. text=..`，断言全放宿主端 Python。因为在壳里再写一遍同样的判据，
+  等于用同一个易错点验证自己。
+
+### ⑦ 验证结果
+
+| 层 | 内容 | 结果 |
+|---|---|---|
+| 解释器 | `python3 tools/verify_clamp.py` | A 10/10 · B 5/5 · C 全绿 |
+| 真机 ART | `bash tests/art/run-art-test.sh`（emulator-5554） | 8/8 通过（含两个真实失败形态：重叠 1 / 重叠 10） |
+| 干净树 | 还原 → `--check` → 实打 → 幂等重跑 | exit 0，+985 字节，重复跑打印「跳过」 |
+| 编译 | `smali.jar assemble -a 34` | 辅助类 904 字节 dex · 目标文件 175904 字节 dex |
+| 全树回编 | `apktool b full-decoded` | exit 0，70272004 字节，dex 编号连续、包名不变 |
+
+完整定位过程另见 [`OVERLAP-FIX.md`](OVERLAP-FIX.md)。

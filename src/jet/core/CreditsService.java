@@ -709,7 +709,7 @@ public final class CreditsService {
             return st;
         }
         JSONObject data = unwrapEnvelope(payload);
-        JSONObject panel = data.optJSONObject("panel");
+        JSONObject panel = resolveMinimaxStatusPanel(data);
         if (panel == null) {
             st.error = "签到面板字段缺失";
             return st;
@@ -794,8 +794,29 @@ public final class CreditsService {
         return b;
     }
 
+    /**
+     * 从 `signin/status` 拆包后的 data 里取出签到面板。
+     *
+     * ⚠️ **status 与 claim 的面板层级不同，勿互相套用**：
+     *   signin/status → 面板字段（scene / days）**直接挂在 data 上**
+     *   signin/claim  → 面板在 data.panel 下
+     *
+     * 早期版本对 status 也取 `data.panel`，于是永远拿到 null：余额照常显示
+     * （走 credit/details，另一个端点），签到块却报「签到面板字段缺失」。
+     * 这里两种形状都接受：`data.panel` 优先，回落到 data 本身。
+     *
+     * @return 面板对象；两种形状都不成立时返回 null。
+     */
+    public static JSONObject resolveMinimaxStatusPanel(JSONObject data) {
+        if (data == null) return null;
+        JSONObject nested = data.optJSONObject("panel");
+        if (nested != null) return nested;
+        if (data.has("days") || data.has("scene")) return data;
+        return null;
+    }
+
     /** 把签到面板映射成状态。 */
-    static Checkin minimaxPanelToStatus(JSONObject panel) {
+    public static Checkin minimaxPanelToStatus(JSONObject panel) {
         Checkin st = new Checkin();
         JSONArray days = panel.optJSONArray("days");
         // ⚠️ 拿到响应即 active=true，不按「有可领项」判 ——
@@ -823,7 +844,10 @@ public final class CreditsService {
         });
         for (int i = 0; i < sorted.size(); i++) {
             JSONObject d = sorted.get(i);
-            if (d.optBoolean("is_today", false)) {
+            // ⚠️ is_today 必须宽容读：协议文档陷阱 80 记载服务端可能回数字 0/1，
+            // 参考实现遇到非 boolean 会**整块丢弃面板**（面板整体消失）。
+            // 这里改成接受 boolean 与 0/1 数字，宁可容错也不让签到块变空。
+            if (readBool(d, "is_today", false)) {
                 today = d;
                 todayIndex = i;
                 break;
@@ -915,6 +939,36 @@ public final class CreditsService {
             try {
                 double d = Double.parseDouble(s);
                 return Double.isFinite(d) ? d : fallback;
+            } catch (NumberFormatException e) {
+                return fallback;
+            }
+        }
+        return fallback;
+    }
+
+    /**
+     * 读布尔，宽容接受 boolean 与数字/数字字符串 0/1。
+     *
+     * ⚠️ MiniMax 的 `is_today` 协议文档记载必须是 boolean，但服务端实际可能回
+     * 数字 0/1；参考实现遇到非 boolean 会把**整个签到面板丢弃**（面板消失）。
+     * 这里宁宽容勿丢弃：只有明确的 0/false 才算 false。
+     */
+    public static boolean readBool(JSONObject o, String key, boolean fallback) {
+        Object v = o.opt(key);
+        if (v instanceof Boolean) return ((Boolean) v).booleanValue();
+        if (v instanceof Number) {
+            double d = ((Number) v).doubleValue();
+            if (Double.isFinite(d)) return d != 0;
+            return fallback;
+        }
+        if (v instanceof String) {
+            String s = ((String) v).trim();
+            if (s.isEmpty()) return fallback;
+            if ("true".equalsIgnoreCase(s)) return true;
+            if ("false".equalsIgnoreCase(s)) return false;
+            try {
+                double d = Double.parseDouble(s);
+                return Double.isFinite(d) ? d != 0 : fallback;
             } catch (NumberFormatException e) {
                 return fallback;
             }

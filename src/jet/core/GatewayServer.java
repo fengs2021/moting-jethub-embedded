@@ -7,6 +7,7 @@ import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -56,6 +57,7 @@ public final class GatewayServer {
     private volatile BuddyProvider buddy;
     private volatile BuddyProvider workbuddy;
     private volatile MinimaxProvider minimax;
+    private volatile OpencodeProvider opencode;
     private final CredentialStore store;
     /** 多账号管理（账号总览 / 签到 / 切号）；旧构造器下也会建一个仅用于端点。 */
     private final AccountManager accounts;
@@ -94,6 +96,7 @@ public final class GatewayServer {
         this.buddy = accounts.buddy(null);
         this.workbuddy = accounts.workbuddy(null);
         this.minimax = accounts.minimax(null);
+        this.opencode = accounts.opencode(null);
     }
 
     /** 兼容旧调用（测试用）：Provider 由外部给定，管理端点仍可用。 */
@@ -421,6 +424,34 @@ public final class GatewayServer {
                 }
             } else if ("/jethub/models".equals(path)) {
                 sendJson(out, 200, modelsJson(query).toString());
+            } else if ("/jethub/opencode/key".equals(path) && "POST".equals(method)) {
+                // OpenCode 没有设备码 / 扫码流程，凭据是一条 API Key；
+                // 匿名通道（免登录）用字面量 public。
+                JSONObject req = body == null || body.trim().isEmpty() ? new JSONObject() : new JSONObject(body);
+                String key = req.optString("api_key", "").trim();
+                String nickname = req.optString("nickname", "").trim();
+                if (key.isEmpty()) {
+                    sendJson(out, 400, errorJson("请填写 API Key（免登录使用请填 public）"));
+                } else {
+                    AccountStore b = accounts.bucket(AccountManager.P_OPENCODE);
+                    if (b == null) {
+                        sendJson(out, 500, errorJson("opencode 账号桶不可用"));
+                    } else {
+                        // 先写入凭据再回列模型，这样 UI 能立刻拿到该 key 可见的目录
+                        JSONObject p = new JSONObject();
+                        p.put("api_key", key);
+                        p.put("nickname", nickname);
+                        p.put("generation", 0);
+                        AccountStore.Account saved = b.upsert(p, null);
+                        accounts.invalidate(AccountManager.P_OPENCODE);
+                        JSONObject ok = new JSONObject();
+                        ok.put("ok", true);
+                        ok.put("id", saved == null ? "" : saved.id);
+                        ok.put("label", saved == null ? "" : saved.label);
+                        ok.put("anonymous", OpencodeProvider.ANONYMOUS_KEY.equals(key));
+                        sendJson(out, 200, ok.toString());
+                    }
+                }
             } else if (path.startsWith("/jethub/models/") && "POST".equals(method)) {
                 String action = path.substring("/jethub/models/".length());
                 JSONObject req = body == null || body.trim().isEmpty() ? new JSONObject() : new JSONObject(body);
@@ -753,6 +784,22 @@ public final class GatewayServer {
         } catch (Exception e) {
             // 未登录 minimax：跳过
         }
+        // OpenCode 模型。⚠️ 它的 listModels 内部已经把远端目录按可达性过滤过
+        // （远端 /v1/models 返回 84+ 个含 claude-*/gpt-* 等我们未实现协议的模型），
+        // 且失败时自带兜底表 ⇒ 未配置任何 key 也能列出免登录可用的免费模型。
+        // provider 为 null 只发生在不传 AccountManager 的旧测试构造器下。
+        if (opencode != null) {
+            try {
+                JSONObject oc = opencode.listModels();
+                JSONArray od = oc.optJSONArray("data");
+                if (od != null) for (int i = 0; i < od.length(); i++) {
+                    JSONObject m = od.optJSONObject(i);
+                    if (m != null) outData.put(m);
+                }
+            } catch (Exception e) {
+                // 未配置或上游不可用：跳过（Provider 内部已回落兜底表，走到这里说明连兜底都失败）
+            }
+        }
         // Cline 模型，同样失败跳过（任何一段都不阻塞整体目录）
         try {
             ClineProvider.Credential c = cline.ensureFresh();
@@ -849,6 +896,10 @@ public final class GatewayServer {
         }
         if (model.startsWith("minimax/")) {
             handleMinimaxChat(req, model.substring("minimax/".length()), out);
+            return;
+        }
+        if (model.startsWith("opencode/")) {
+            handleOpencodeChat(req, model.substring("opencode/".length()), out);
             return;
         }
         // 剥掉 cline/ 前缀
@@ -988,6 +1039,130 @@ public final class GatewayServer {
             out.flush();
             resp.close();
         }
+    }
+
+    /**
+     * OpenCode Zen 对话转发。
+     *
+     * <p>与其余五家最大的不同：它是<b>标准 OpenAI 兼容</b>，响应就是标准 OpenAI SSE，
+     * 故流式可原样透传、非流式由 {@link OpencodeProvider#aggregate} 收口，
+     * 不需要新建 SseConverter。
+     *
+     * <p>但有两处必须由 Provider 侧保证，缺一则匿名通道一律 403：
+     * ① 五个 {@code x-opencode-*} 指纹头；② body 的 FreeTier 形状门禁
+     * （{@code stream:true} + {@code tools} 含 {@code bash}/{@code read}）。
+     * 两者都在 {@link OpencodeProvider#buildPayload} 与
+     * {@link OpencodeProvider#headers} 里处理，这里只负责转发与错误文案。
+     */
+    private void handleOpencodeChat(JSONObject req, String model, OutputStream out) throws Exception {
+        boolean stream = req.optBoolean("stream", false);
+        OpencodeProvider.Credential c;
+        try {
+            c = opencode.ensureFresh();
+        } catch (Exception e) {
+            sendJson(out, 400, errorJson("未配置 OpenCode 账号：" + e.getMessage()));
+            return;
+        }
+        JSONObject payload = OpencodeProvider.buildPayload(req, model);
+        String sessionId = opencode.sessionId();
+
+        HttpFetcher.Response resp = opencode.chatRaw(c, payload, sessionId);
+        if (resp.status != 200) {
+            // ⚠️ 必须先读体再判断：Zen 的额度错误语义（FreeUsageLimitError 等）在响应体里，
+            // 而 body 只能读一次。
+            String err = resp.readText();
+            resp.close();
+            OpencodeProvider.ErrorInfo info = OpencodeProvider.classifyError(
+                    resp.status, err, firstHeader(resp, "retry-after"));
+            sendJson(out, resp.status >= 400 ? resp.status : 502,
+                    errorJson(opencodeErrorMessage(info, c)));
+            return;
+        }
+        if (!stream) {
+            String text = resp.readText();
+            resp.close();
+            sendJson(out, 200, OpencodeProvider.aggregate(model, text).toString());
+            return;
+        }
+        // 流式：上游已是标准 OpenAI SSE，逐块透传（墨听按 OpenAI 流式解析）
+        out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                + "Cache-Control: no-cache\r\nConnection: close\r\n\r\n")
+                .getBytes(StandardCharsets.ISO_8859_1));
+        out.flush();
+        try (InputStream in = resp.body) {
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                out.flush();
+            }
+        } finally {
+            resp.close();
+        }
+    }
+
+    /**
+     * 把语义化错误翻成「用户下一步该做什么」。
+     *
+     * <p>⚠️ 这里的措辞直接决定用户会不会做无用功：额度用尽必须说「等窗口恢复 / 换账号」，
+     * 余额不足必须说「去充值」，说成「服务端故障，请重试」会让用户无限重试一个
+     * 永远不会成功的请求。
+     */
+    private static String opencodeErrorMessage(OpencodeProvider.ErrorInfo info, OpencodeProvider.Credential c) {
+        String who = c.isAnonymous() ? "匿名通道（免登录）" : "当前账号";
+        String detail = info.detail == null || info.detail.isEmpty() ? "" : "：" + info.detail;
+        if (OpencodeProvider.KIND_FREE_USAGE_LIMIT.equals(info.kind)) {
+            return "OpenCode 免费额度今日已用尽（" + who + "）" + detail
+                    + " —— 明日恢复，或添加一个付费 API Key 继续。";
+        }
+        if (OpencodeProvider.KIND_GO_USAGE_LIMIT.equals(info.kind)) {
+            return "OpenCode 当日额度已用尽（" + who + "）" + detail + " —— 请等待额度恢复。";
+        }
+        if (OpencodeProvider.KIND_RATE_LIMIT.equals(info.kind)) {
+            String wait = info.retryAfterMs == null ? "" : "（约 " + (info.retryAfterMs / 1000) + " 秒后可重试）";
+            return "OpenCode 请求过于频繁" + wait + detail;
+        }
+        if (OpencodeProvider.KIND_QUOTA.equals(info.kind)) {
+            return "OpenCode 账号余额不足" + detail + " —— 请到 opencode.ai 充值后再试。";
+        }
+        if (OpencodeProvider.KIND_AUTH.equals(info.kind)) {
+            return "OpenCode 认证失败（" + who + "）" + detail
+                    + " —— 该模型可能需要付费 Key，或 Key 已失效。";
+        }
+        if (OpencodeProvider.KIND_FREE_TIER.equals(info.kind)) {
+            // 形状门禁拒绝：这是本项目内部的形状问题，不是用户配置错，须明确说出来
+            return "OpenCode 拒绝了本次请求的形态（FreeTier）" + detail
+                    + " —— 若反复出现请反馈，这是本网关的兼容性问题。";
+        }
+        if (OpencodeProvider.KIND_TRANSPORT.equals(info.kind)) {
+            return "无法连接 OpenCode" + detail + " —— 请检查网络或代理。";
+        }
+        return "OpenCode 服务异常" + detail;
+    }
+
+    /** 取响应头首个值（HttpFetcher 的头名已由调用方保证大小写，这里再兜一层）。 */
+    private static String firstHeader(HttpFetcher.Response resp, String name) {
+        try {
+            for (Map.Entry<String, java.util.List<String>> e : resp.headers.entrySet()) {
+                if (e.getKey() != null && e.getKey().equalsIgnoreCase(name)
+                        && e.getValue() != null && !e.getValue().isEmpty()) {
+                    return e.getValue().get(0);
+                }
+            }
+        } catch (Exception ignored) { }
+        return null;
+    }
+
+    /** 标准 OpenAI 错误信封。 */
+    private static String errorJson(String message) {
+        JSONObject err = new JSONObject();
+        JSONObject inner = new JSONObject();
+        try {
+            inner.put("message", message);
+            inner.put("type", "upstream_error");
+            err.put("error", inner);
+        } catch (Exception ignored) { }
+        return err.toString();
     }
 
     private JSONObject openAiChunk(String id, String model, boolean first, String content, String reasoning)

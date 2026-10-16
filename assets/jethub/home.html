@@ -187,6 +187,7 @@ section.panel.on{display:block}
 .pv-mark.k-buddy{color:#8fc9a4;border-color:rgba(143,201,164,.3);background:rgba(143,201,164,.10)}
 .pv-mark.k-workbuddy{color:#d9c47f;border-color:rgba(217,196,127,.3);background:rgba(217,196,127,.10)}
 .pv-mark.k-minimax{color:#d98fa8;border-color:rgba(217,143,168,.3);background:rgba(217,143,168,.10)}
+.pv-mark.k-opencode{color:#a9a2e0;border-color:rgba(169,162,224,.3);background:rgba(169,162,224,.10)}
 .pv-txt{flex:1;min-width:0}
 .pv-txt b{display:block;font-size:14.5px;font-weight:600;line-height:1.3}
 .pv-txt span{display:block;font-size:11.5px;color:var(--paper-3);line-height:1.4}
@@ -311,6 +312,11 @@ section.panel.on{display:block}
 .flow-hd b{flex:1;font-size:13px;font-weight:600;color:var(--paper)}
 .flow p{margin:0 0 9px;font-size:12.5px;color:var(--paper-2);line-height:1.65}
 .flow .lbl{font-size:11px;color:var(--paper-3);letter-spacing:.06em;margin-bottom:5px}
+.flow .inp{width:100%;box-sizing:border-box;margin:0 0 8px;padding:9px 10px;border-radius:9px;
+  border:1px solid var(--line);background:var(--ink-600);color:var(--paper);
+  font-family:inherit;font-size:13px;line-height:1.4;-webkit-appearance:none}
+.flow .inp:focus{outline:none;border-color:var(--line-strong)}
+.flow .hint{font-size:11.5px;line-height:1.55;color:var(--paper-3);margin:0 0 9px}
 .codebox{
   display:flex;align-items:center;gap:10px;border-radius:var(--r-sm);
   background:var(--ink-900);border:1px solid var(--line-strong);padding:11px 12px;margin-bottom:10px;
@@ -726,7 +732,8 @@ footer.ft .sep{opacity:.4;margin:0 6px}
     { id: 'trae',      name: 'Trae',       note: '短信 / 扫码',  checkin: true,  kind: 'trae',      mark: 'T' },
     { id: 'buddy',     name: 'CodeBuddy',  note: '浏览器授权',   checkin: true,  kind: 'buddy',     mark: 'B' },
     { id: 'workbuddy', name: 'WorkBuddy',  note: '浏览器授权',   checkin: false, kind: 'workbuddy', mark: 'W' },
-    { id: 'minimax',   name: 'MiniMax',    note: '设备码登录',   checkin: true,  kind: 'minimax',   mark: 'M' }
+    { id: 'minimax',   name: 'MiniMax',    note: '设备码登录',   checkin: true,  kind: 'minimax',   mark: 'M' },
+    { id: 'opencode',  name: 'OpenCode',   note: 'API Key（留空免登录）', checkin: false, kind: 'opencode', mark: 'O', keyOnly: true }
   ];
 
   var CHECKIN_LABEL = {
@@ -973,7 +980,11 @@ footer.ft .sep{opacity:.4;margin:0 6px}
       else path = '/' + provider + '/login/start';
       return req(path, 'POST', {});
     },
-    logout: function () { return req('/logout', 'POST', {}); }
+    logout: function () { return req('/logout', 'POST', {}); },
+    // OpenCode 没有设备码 / 扫码流程，凭据就是一条 API Key（免登录填 public）
+    opencodeKey: function (key, nickname) {
+      return req('/opencode/key', 'POST', { api_key: key, nickname: nickname });
+    }
   };
 
   /* ------------------------------------------------------------- 按钮态 */
@@ -1274,7 +1285,7 @@ footer.ft .sep{opacity:.4;margin:0 6px}
 
     if (list.length === 0) {
       h += '<div class="empty">' + icon('i-user')
-        + '<b>尚未添加账号</b><p>点击下方按钮开始登录</p></div>';
+        + '<b>尚未添加账号</b><p>' + (pv.keyOnly ? '在下方填入 API Key，或直接免登录使用免费模型' : '点击下方按钮开始登录') + '</p></div>';
     } else {
       for (var j = 0; j < list.length; j++) {
         if (!isObj(list[j])) continue;
@@ -1284,10 +1295,26 @@ footer.ft .sep{opacity:.4;margin:0 6px}
 
     h += flowHtml(pv);
 
-    h += '<div style="margin-top:11px">'
-      + '<button type="button" class="btn wide" data-flow-act="start" data-provider="' + esc(pv.id) + '"'
-      + (S.flows[pv.id] && S.flows[pv.id].state !== 'error' && S.flows[pv.id].state !== 'done' ? ' disabled' : '')
-      + '>' + icon('i-plus') + '<span>添加账号</span></button></div>';
+    if (pv.keyOnly) {
+      // OpenCode：没有设备码 / 扫码流程，凭据是一条 API Key。
+      // 留空即免登录（服务端用字面量 public 走匿名通道，只能用免费模型）。
+      h += '<div style="margin-top:11px">'
+        + '<div class="lbl">API Key</div>'
+        + '<input class="inp" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" '
+        + 'spellcheck="false" data-oc-key="1" placeholder="sk-…（留空则免登录，仅免费模型）">'
+        + '<input class="inp" type="text" autocomplete="off" data-oc-nick="1" placeholder="备注名（可选，多个 Key 时便于区分）">'
+        + '<p class="hint">免登录通道只能用带「（免费）」后缀的模型，且按出口 IP 限速；'
+        + '要使用付费模型请到 opencode.ai 生成 API Key 填入。</p>'
+        + '<button type="button" class="btn wide" data-oc-add="1" data-provider="' + esc(pv.id) + '">'
+        + icon('i-plus') + '<span>添加 API Key</span></button></div>';
+      h += '<div style="margin-top:8px"><button type="button" class="btn wide gho" data-oc-free="1" '
+        + 'data-provider="' + esc(pv.id) + '">' + icon('i-cloud') + '<span>免登录添加（免费模型）</span></button></div>';
+    } else {
+      h += '<div style="margin-top:11px">'
+        + '<button type="button" class="btn wide" data-flow-act="start" data-provider="' + esc(pv.id) + '"'
+        + (S.flows[pv.id] && S.flows[pv.id].state !== 'error' && S.flows[pv.id].state !== 'done' ? ' disabled' : '')
+        + '>' + icon('i-plus') + '<span>添加账号</span></button></div>';
+    }
 
     if (pv.id === 'cline' && list.length > 0) {
       h += '<div style="margin-top:8px"><button type="button" class="btn wide danger" data-flow-act="logout">'
@@ -2337,6 +2364,10 @@ footer.ft .sep{opacity:.4;margin:0 6px}
           var ckA = node.getAttribute('data-ck');
           var cf = node.getAttribute('data-confirm');
           var cp = node.getAttribute('data-copy-btn');
+          var ocAdd = node.getAttribute('data-oc-add');
+          var ocFree = node.getAttribute('data-oc-free');
+          if (ocAdd) { ev.preventDefault(); onOpencodeAdd(node, false); return; }
+          if (ocFree) { ev.preventDefault(); onOpencodeAdd(node, true); return; }
           if (act) { ev.preventDefault(); onAct(node, act); return; }
           if (fa) { ev.preventDefault(); onFlow(node, fa); return; }
           if (ckA) { ev.preventDefault(); onCk(node); return; }
@@ -2424,6 +2455,33 @@ footer.ft .sep{opacity:.4;margin:0 6px}
       return;
     }
     if (act === 'logout') { doLogout(node); return; }
+  }
+
+  /**
+   * OpenCode 添加凭据（没有设备码流程，直接写 API Key）。
+   * 免登录按钮传 key='public'，与官方 CLI 无 key 时的行为一致。
+   */
+  function onOpencodeAdd(node, anonymous) {
+    var provider = s(node.getAttribute('data-provider')) || 'opencode';
+    var card = closestByClass(node, 'prov', 8);
+    var keyEl = card ? card.querySelector('[data-oc-key]') : null;
+    var nickEl = card ? card.querySelector('[data-oc-nick]') : null;
+    var key = anonymous ? 'public' : (keyEl ? s(keyEl.value) : '');
+    var nickname = nickEl ? s(nickEl.value) : '';
+    if (!anonymous && !key) {
+      // 用户点了「添加 API Key」但留空 —— 按提示语义视为免登录，避免卡在报错上
+      anonymous = true;
+      key = 'public';
+    }
+    busy(node, true);
+    api.opencodeKey(key, nickname).then(function (res) {
+      if (keyEl) keyEl.value = '';
+      if (nickEl) nickEl.value = '';
+      toast('ok', anonymous ? '已添加免登录通道' : '已添加 API Key');
+      return loadAccounts().then(function () { loadCredits(true); });
+    })['catch'](function (e) {
+      toast('err', '添加失败：' + errText(e));
+    })['then'](function () { busy(node, false); });
   }
 
   function onCk(node) {

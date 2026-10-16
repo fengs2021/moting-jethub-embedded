@@ -42,6 +42,9 @@ public final class Boot {
                 // 多账号：Provider 全部建立在「活跃账号视图」上，切换账号无需重启网关
                 AccountManager accounts = new AccountManager(store);
                 AppContextHolder.initAccounts(accounts);
+                // OpenCode 的免费模型走匿名通道（Bearer public），补一条默认账号，
+                // 让用户完全不配 key 也能用它；幂等且尊重用户手动的删除。
+                accounts.ensureDefaultOpencodeAccount();
                 GatewayServer gw = new GatewayServer(accounts);
                 gw.start();
                 started = true;

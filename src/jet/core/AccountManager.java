@@ -33,6 +33,7 @@ public final class AccountManager {
     public static final String P_BUDDY = "buddy";
     public static final String P_WORKBUDDY = "workbuddy";
     public static final String P_MINIMAX = "minimax";
+    public static final String P_OPENCODE = "opencode";
 
     /** 供应商元数据（顺序即界面顺序）。 */
     public static final class Meta {
@@ -56,6 +57,10 @@ public final class AccountManager {
         // already-claimed 语义，对用户是误导）。故此处与 jethub 保持一致：不可签到。
         PROVIDERS.add(new Meta(P_WORKBUDDY, "WorkBuddy", "浏览器授权", false));
         PROVIDERS.add(new Meta(P_MINIMAX, "MiniMax", "设备码登录", true));
+        // ⚠️ OpenCode 无签到活动也无余额接口，checkin 必须 false，否则界面会出现
+        // 一个永远失败的签到按钮。它的登录形态也与其余五家不同：不是设备码/扫码，
+        // 而是**直接填 API key**（且可留空走匿名通道，用字面量 public 当 key）。
+        PROVIDERS.add(new Meta(P_OPENCODE, "OpenCode", "API Key（可留空免登录）", false));
     }
 
     /** 余额/签到缓存有效期：避免每次开页面都打 5 家上游。 */
@@ -79,6 +84,8 @@ public final class AccountManager {
                 BuddyProvider.Variant.workbuddy().credentialRef, new BuddyIdentity()));
         buckets.put(P_MINIMAX, new AccountStore(global, "JETHUB_MINIMAX_ACCOUNTS",
                 MinimaxProvider.CREDENTIAL_REF, new MinimaxIdentity()));
+        buckets.put(P_OPENCODE, new AccountStore(global, "JETHUB_OPENCODE_ACCOUNTS",
+                OpencodeProvider.CREDENTIAL_REF, new OpencodeIdentity()));
     }
 
     public CredentialStore globalStore() { return global; }
@@ -92,6 +99,7 @@ public final class AccountManager {
         if (P_BUDDY.equals(providerId)) return BuddyProvider.Variant.buddy().credentialRef;
         if (P_WORKBUDDY.equals(providerId)) return BuddyProvider.Variant.workbuddy().credentialRef;
         if (P_MINIMAX.equals(providerId)) return MinimaxProvider.CREDENTIAL_REF;
+        if (P_OPENCODE.equals(providerId)) return OpencodeProvider.CREDENTIAL_REF;
         return null;
     }
 
@@ -160,6 +168,36 @@ public final class AccountManager {
 
     public MinimaxProvider minimax(String accountId) { return new MinimaxProvider(view(P_MINIMAX, accountId)); }
 
+    public OpencodeProvider opencode(String accountId) {
+        return new OpencodeProvider(view(P_OPENCODE, accountId));
+    }
+
+    /**
+     * 保证 OpenCode 至少有一条账号，让用户在**完全没配任何 key** 时也能用它。
+     *
+     * <p>OpenCode 的免费模型走匿名通道（{@code Authorization: Bearer public}），
+     * 所以「零账号」本该可用；但本项目的 Provider 一律要求桶里有一条凭据，
+     * 否则 {@code ensureFresh()} 直接抛未配置。这里补一条匿名账号补上这个缺口。
+     *
+     * <p><b>幂等且尊重删除</b>：只在桶<b>一条账号都没有</b>时补。
+     * 用户删掉匿名条目、只留自己的付费 key，之后重启不会又被塞回来；
+     * 想再要匿名通道，在界面上手动加一条 key 填 {@code public} 即可。
+     */
+    public void ensureDefaultOpencodeAccount() {
+        try {
+            AccountStore b = buckets.get(P_OPENCODE);
+            if (b == null) return;
+            if (!b.load().accounts.isEmpty()) return;
+            JSONObject p = new JSONObject();
+            p.put("api_key", OpencodeProvider.ANONYMOUS_KEY);
+            p.put("nickname", "");
+            p.put("generation", 0);
+            b.upsert(p, null);
+        } catch (Exception ignored) {
+            // 存储不可写不该拖垮网关启动
+        }
+    }
+
     /** 按活跃账号造 Provider（聊天/列模型走它）。 */
     public Object providerFor(String providerId) {
         if (P_CLINE.equals(providerId)) return cline(null);
@@ -167,6 +205,7 @@ public final class AccountManager {
         if (P_BUDDY.equals(providerId)) return buddy(null);
         if (P_WORKBUDDY.equals(providerId)) return workbuddy(null);
         if (P_MINIMAX.equals(providerId)) return minimax(null);
+        if (P_OPENCODE.equals(providerId)) return opencode(null);
         return null;
     }
 
@@ -255,6 +294,13 @@ public final class AccountManager {
     private void invalidate(String providerId, String accountId) {
         cacheAt.remove(providerId + "/" + accountId + ":bal");
         cacheAt.remove(providerId + "/" + accountId + ":ck");
+    }
+
+    /** 使某家全部账号的缓存失效（新增/删除凭据后调用，避免 UI 拿到旧列表）。 */
+    public void invalidate(String providerId) {
+        cacheAt.keySet().removeIf(k -> k.startsWith(providerId + "/"));
+        balanceCache.keySet().removeIf(k -> k.startsWith(providerId + "/"));
+        checkinCache.keySet().removeIf(k -> k.startsWith(providerId + "/"));
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -498,6 +544,7 @@ public final class AccountManager {
         if (P_BUDDY.equals(providerId)) return buddy(accountId);
         if (P_WORKBUDDY.equals(providerId)) return workbuddy(accountId);
         if (P_MINIMAX.equals(providerId)) return minimax(accountId);
+        if (P_OPENCODE.equals(providerId)) return opencode(accountId);
         return null;
     }
 
@@ -506,6 +553,9 @@ public final class AccountManager {
         else if (p instanceof TraeProvider) ((TraeProvider) p).ensureFresh();
         else if (p instanceof BuddyProvider) ((BuddyProvider) p).ensureFresh();
         else if (p instanceof MinimaxProvider) ((MinimaxProvider) p).ensureFresh();
+        // OpenCode 没有续期概念（key 是长期凭据）：走到这里只是校验凭据仍可读；
+        // 真正判断「key 还能不能用」由 test / credits 动作打一次上游完成。
+        else if (p instanceof OpencodeProvider) ((OpencodeProvider) p).ensureFresh();
     }
 
     /** 返回可用模型数；-1 表示失败。 */
@@ -527,6 +577,9 @@ public final class AccountManager {
             } else if (p instanceof MinimaxProvider) {
                 ((MinimaxProvider) p).ensureFresh();
                 models = ((MinimaxProvider) p).listModels();
+            } else if (p instanceof OpencodeProvider) {
+                ((OpencodeProvider) p).ensureFresh();
+                models = ((OpencodeProvider) p).listModels();
             } else {
                 return -1;
             }
@@ -685,6 +738,43 @@ public final class AccountManager {
         @Override public String labelOf(JSONObject p) {
             String n = p.optString("nickname", "");
             return n.isEmpty() ? "MiniMax 账号" : n;
+        }
+    }
+
+    /** OpenCode 身份抽取。 */
+    static final class OpencodeIdentity implements AccountStore.Identity {
+        /**
+         * ⚠️ **匿名槽的身份必须与账号槽区分开**。
+         *
+         * <p>所有匿名槽的 {@code api_key} 都是字面量 {@code public}；若直接拿
+         * apiKey 当身份，多加几个匿名槽（各自配不同代理 = 不同出口 IP = 不同配额桶）
+         * 会互相覆盖成一个账号，多开代理的意义全部消失。
+         * 故匿名槽退化用 nickname 区分，没有再退到固定常量（此时重新添加是覆盖）。
+         *
+         * <p>账号槽（真 {@code sk-…} key）用 apiKey 本身：它天然一账号一身份，
+         * 且不像 access_token 会续期换值。
+         */
+        @Override public String identityOf(JSONObject p) {
+            String key = p.optString("api_key", "");
+            if (key.isEmpty()) return null;
+            if (OpencodeProvider.ANONYMOUS_KEY.equals(key)) {
+                String n = p.optString("nickname", "");
+                return n.isEmpty() ? "opencode:anonymous" : "opencode:anonymous:" + n;
+            }
+            return "opencode:" + key;
+        }
+
+        @Override public String labelOf(JSONObject p) {
+            String key = p.optString("api_key", "");
+            if (OpencodeProvider.ANONYMOUS_KEY.equals(key)) {
+                String n = p.optString("nickname", "");
+                return n.isEmpty() ? "匿名通道（免登录）" : "匿名通道 · " + n;
+            }
+            String n = p.optString("nickname", "");
+            if (!n.isEmpty()) return n;
+            // key 本身是秘密，标签里只留可辨认的前后少量字符
+            if (key.length() > 12) return "API Key " + key.substring(0, 6) + "…" + key.substring(key.length() - 4);
+            return "API Key";
         }
     }
 }

@@ -102,6 +102,145 @@ public class RegTest {
         if (ck2.streakDays != 2) throw new AssertionError("数字 is_today 连续天数应为 2，实际 " + ck2.streakDays);
         System.out.println("签到面板-数字 is_today: streak=" + ck2.streakDays + " todayCheckedIn=" + ck2.todayCheckedIn);
 
+        // ── OpenCode 适配器（回归：形状门禁与错误分类都极易写错） ──
+        opencodeCases();
+
         System.out.println("REG PASS");
+    }
+
+    private static void opencodeCases() throws Exception {
+        // ① session id 形状：ses_ + 12 hex + 14 base62 = 尾段 26。
+        //    写成随机 26 位会产出 ses_+38 字符，匿名通道一律 403 FreeTierError。
+        for (int i = 0; i < 200; i++) {
+            String sid = OpencodeProvider.deriveSessionId();
+            if (!sid.matches("ses_[0-9a-f]{12}[0-9A-Za-z]{14}")) {
+                throw new AssertionError("session id 形状错: " + sid);
+            }
+        }
+        System.out.println("OpenCode-session id: 形状 ses_+12hex+14base62 正确（200 次）");
+
+        // ② request id：req_ + 32 hex
+        String rid = OpencodeProvider.deriveRequestId();
+        if (!rid.matches("req_[0-9a-f]{32}")) throw new AssertionError("request id 形状错: " + rid);
+
+        // ③ project id：40 位小写 hex，且同身份稳定、换代次即变
+        String p1 = OpencodeProvider.deriveProjectId("sk-abc", 0);
+        String p2 = OpencodeProvider.deriveProjectId("sk-abc", 0);
+        String p3 = OpencodeProvider.deriveProjectId("sk-abc", 1);
+        if (!p1.matches("[0-9a-f]{40}")) throw new AssertionError("project id 形状错: " + p1);
+        if (!p1.equals(p2)) throw new AssertionError("project id 对同身份不稳定");
+        if (p1.equals(p3)) throw new AssertionError("换代次后 project id 应变化");
+        System.out.println("OpenCode-指纹: project id 稳定且随代次变化");
+
+        // ④ 形状门禁：必须补 bash/read，且只在原本无工具时补 tool_choice
+        JSONObject bare = new JSONObject("{\"model\":\"m\",\"messages\":[]}");
+        OpencodeProvider.ensureFreeLaneShape(bare);
+        JSONObject bt = bare.getJSONArray("tools").getJSONObject(0).getJSONObject("function");
+        java.util.Set<String> names = new java.util.HashSet<>();
+        for (int i = 0; i < bare.getJSONArray("tools").length(); i++) {
+            names.add(bare.getJSONArray("tools").getJSONObject(i).getJSONObject("function").getString("name"));
+        }
+        if (!names.contains("bash") || !names.contains("read")) {
+            throw new AssertionError("门禁工具未补齐: " + names);
+        }
+        if (!"none".equals(bare.optString("tool_choice"))) {
+            throw new AssertionError("原本无工具时应补 tool_choice=none");
+        }
+        if (!bt.getString("description").contains("do not call")) {
+            throw new AssertionError("门禁工具描述不合规");
+        }
+
+        // 用户自带工具时：不得注入 tool_choice（否则模型无法调用任何工具）
+        JSONObject withTools = new JSONObject(
+            "{\"messages\":[],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\"}}],"
+            + "\"tool_choice\":\"auto\"}");
+        OpencodeProvider.ensureFreeLaneShape(withTools);
+        if (!"auto".equals(withTools.optString("tool_choice"))) {
+            throw new AssertionError("已有工具时覆盖了用户的 tool_choice");
+        }
+        java.util.Set<String> n2 = new java.util.HashSet<>();
+        for (int i = 0; i < withTools.getJSONArray("tools").length(); i++) {
+            n2.add(withTools.getJSONArray("tools").getJSONObject(i).getJSONObject("function").getString("name"));
+        }
+        if (!n2.contains("read")) throw new AssertionError("已有 bash 时仍应补 read: " + n2);
+        System.out.println("OpenCode-门禁: 补 bash/read，且不覆盖用户 tool_choice");
+
+        // ⑤ body：stream 恒 true（门禁的一半要求）
+        JSONObject payload = OpencodeProvider.buildPayload(
+            new JSONObject("{\"model\":\"m\",\"messages\":[],\"stream\":false}"), "big-pickle");
+        if (!payload.optBoolean("stream", false)) throw new AssertionError("stream 必须恒为 true");
+        if (!"big-pickle".equals(payload.getString("model"))) throw new AssertionError("model 未透传");
+        System.out.println("OpenCode-body: stream 恒 true，model 透传");
+
+        // ⑥ 错误分类：顺序即优先级，额度语义必须在 auth 之前
+        checkKind(429, "{\"error\":\"too many requests\"}", OpencodeProvider.KIND_RATE_LIMIT);
+        checkKind(401, "{\"error\":\"FreeUsageLimitError\"}", OpencodeProvider.KIND_FREE_USAGE_LIMIT);
+        checkKind(403, "{\"error\":\"GoUsageLimitError\"}", OpencodeProvider.KIND_GO_USAGE_LIMIT);
+        checkKind(403, "{\"error\":\"FreeTierError\"}", OpencodeProvider.KIND_FREE_TIER);
+        checkKind(402, "{\"error\":{\"type\":\"server_error\",\"message\":\"Insufficient account funds\"}}",
+                OpencodeProvider.KIND_QUOTA);
+        checkKind(401, "{\"error\":\"unauthorized\"}", OpencodeProvider.KIND_AUTH);
+        checkKind(500, "{\"error\":\"boom\"}", OpencodeProvider.KIND_SERVER);
+        checkKind(0, "", OpencodeProvider.KIND_TRANSPORT);
+        System.out.println("OpenCode-错误分类: 额度/形状/余额/auth/server/transport 全部正确");
+
+        // ⑦ retry-after：0 是合法值（「立即解除」），必须与「未给」区分
+        if (OpencodeProvider.parseRetryAfterMs(null) != null) throw new AssertionError("缺头应返回 null");
+        if (OpencodeProvider.parseRetryAfterMs("") != null) throw new AssertionError("空串应返回 null");
+        Long zero = OpencodeProvider.parseRetryAfterMs("0");
+        if (zero == null || zero != 0L) throw new AssertionError("0 必须解析成 0 而不是 null");
+        Long sixty = OpencodeProvider.parseRetryAfterMs("60");
+        if (sixty == null || sixty != 60000L) throw new AssertionError("60 应解析成 60000ms");
+        System.out.println("OpenCode-retry-after: 0 与「未给」正确区分");
+
+        // ⑧ 模型表：表内/免费判定；表外一律不可达也不免费
+        if (!OpencodeProvider.isFree("big-pickle")) throw new AssertionError("big-pickle 应免费");
+        if (OpencodeProvider.isFree("deepseek-v4-flash")) throw new AssertionError("付费模型不应判为免费");
+        if (OpencodeProvider.isFree("claude-sonnet-4")) throw new AssertionError("表外模型不应判为免费");
+        if (OpencodeProvider.isReachable("claude-sonnet-4")) throw new AssertionError("表外模型不应可达");
+        if (!OpencodeProvider.displayName("big-pickle").contains("免费")) {
+            throw new AssertionError("免费模型展示名应带「（免费）」");
+        }
+        System.out.println("OpenCode-模型表: 免费/可达判定与展示名正确");
+
+        // ⑨ 非流式聚合：标准 OpenAI SSE → 标准非流式响应
+        String sse = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你\"}}]}\n\n"
+                + "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\"}}]}\n\n"
+                + "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                + "data: [DONE]\n\n";
+        JSONObject agg = OpencodeProvider.aggregate("big-pickle", sse);
+        String got = agg.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content");
+        if (!"你好".equals(got)) throw new AssertionError("聚合内容错: " + got);
+        if (!"c1".equals(agg.optString("id"))) throw new AssertionError("聚合 id 未取自首个分片");
+        System.out.println("OpenCode-聚合: SSE → 非流式，content=你好");
+
+        // ⑩ 请求头：只发 5 个指纹头，绝不发 x-session-affinity / X-Session-Id
+        OpencodeProvider.Credential c = new OpencodeProvider.Credential();
+        c.apiKey = OpencodeProvider.ANONYMOUS_KEY;
+        java.util.Map<String, String> h = OpencodeProvider.headers(c, "ses_" + "0".repeat(26), rid);
+        String[] must = {"x-opencode-project", "x-opencode-session", "x-opencode-request",
+                "x-opencode-client", "user-agent"};
+        for (String k : must) {
+            if (!h.containsKey(k)) throw new AssertionError("缺指纹头: " + k);
+        }
+        if (!"cli".equals(h.get("x-opencode-client"))) throw new AssertionError("x-opencode-client 应为 cli");
+        if (!("Bearer " + OpencodeProvider.ANONYMOUS_KEY).equals(h.get("authorization"))) {
+            throw new AssertionError("匿名槽授权头应为 Bearer public");
+        }
+        for (String k : h.keySet()) {
+            String lk = k.toLowerCase();
+            if (lk.contains("session-affinity") || lk.equals("x-session-id")) {
+                throw new AssertionError("不该发送的头: " + k);
+            }
+        }
+        if (!c.isAnonymous()) throw new AssertionError("public 应判定为匿名槽");
+        System.out.println("OpenCode-请求头: 5 个指纹头齐备，无多余会话头");
+    }
+
+    private static void checkKind(int status, String body, String expected) {
+        OpencodeProvider.ErrorInfo info = OpencodeProvider.classifyError(status, body, null);
+        if (!expected.equals(info.kind)) {
+            throw new AssertionError("status=" + status + " 应归类为 " + expected + "，实际 " + info.kind);
+        }
     }
 }

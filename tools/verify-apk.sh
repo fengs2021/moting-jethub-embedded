@@ -167,6 +167,27 @@ else
   else
     bad "找不到 AudioComicImageDeliveryFastLane.smali"
   fi
+  # OpenCode 适配器：类落位 + 三个最易写错的实现点。
+  #   - session id 形状（ses_ + 12hex + 14base62）：写成随机 26 位会产出 38 字符，
+  #     匿名通道一律 403 FreeTierError，而付费通道正常 ⇒ 只测免登录才会暴露；
+  #   - 形状门禁（tools 必须含 bash/read）：漏了就整条匿名通道不可用；
+  #   - 错误分类（额度/余额在 auth 之前判）：写错会让用户看到「服务端故障」并无限重试。
+  ocp="$(find "$W" -path '*jet/core/OpencodeProvider.smali' 2>/dev/null | head -1)"
+  if [ -n "$ocp" ]; then
+    oc_dex="$(echo "$ocp" | sed 's|.*/smali_||; s|/.*||')"
+    ok "OpencodeProvider 已打入 $oc_dex"
+    for m in deriveSessionId ensureFreeLaneShape classifyError parseRetryAfterMs buildPayload; do
+      grep -q "^\.method.*$m" "$ocp" || bad "OpencodeProvider 缺方法：$m"
+    done
+    oc_ids="$(find "$W" -name 'AccountManager$OpencodeIdentity.smali' 2>/dev/null | head -1)"
+    if [ -n "$oc_ids" ]; then
+      ok "AccountManager 已登记 opencode 平台（含 OpencodeIdentity）"
+    else
+      bad "AccountManager 缺 OpencodeIdentity → 平台不会出现在管理页"
+    fi
+  else
+    bad "找不到 OpencodeProvider.smali → opencode 平台未编进包"
+  fi
 fi
 
 echo
@@ -191,6 +212,14 @@ fi
 
 if unzip -l "$APK" | grep -q 'assets/jethub/home.html'; then
   ok "assets/jethub/home.html 已打入（$(unzip -l "$APK" | grep 'assets/jethub/home.html' | awk '{print $1}') 字节）"
+  # home.html 是明文资源（不走 aapt2 编译），可直接 grep。
+  # 管理页少了 opencode 的卡片/表单，平台即使编进包里用户也点不到。
+  hm="$(unzip -p "$APK" assets/jethub/home.html 2>/dev/null)"
+  if echo "$hm" | grep -q 'data-oc-add' && echo "$hm" | grep -q 'k-opencode'; then
+    ok "管理页含 OpenCode 卡片（API Key 表单 + 配色）"
+  else
+    bad "管理页缺 OpenCode 卡片 → 平台在网关里但没有入口"
+  fi
 else
   bad "assets/jethub/home.html 缺失 → 管理页打不开"
 fi

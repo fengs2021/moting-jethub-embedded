@@ -120,7 +120,7 @@ Compose 生成的 lambda id，而不是靠行号。
 - 墨听把网关当成一个普通的 OpenAI 兼容中转：**Base URL `http://127.0.0.1:8391/v1`**，
   API Key 是管理页展示的本地密钥（运行时随机生成，非硬编码）。
 - 模型 id 形如 `cline/space-bunny-alpha`、`trae/...`、`buddy/...`、`workbuddy/...`、
-  `minimax/...`，网关按前缀路由；同一个账号下可以同时开多家。
+  `minimax/...`、`opencode/...`，网关按前缀路由；同一个账号下可以同时开多家。
 - 供应商的 token 过期由后台续期，凭据存 `CredentialStore`（App 私有目录），手机重启后依然有效。
 
 ## 当前进度
@@ -132,16 +132,47 @@ Compose 生成的 lambda id，而不是靠行号。
 | CodeBuddy (Buddy) | ✅ | ✅ | ✅ | ✅ 浏览器轮询 |
 | WorkBuddy | ✅ | ✅ | ✅ | ✅ 浏览器轮询 |
 | MiniMax | ✅ | ✅ | ✅ | ✅ 设备码 + PKCE |
+| OpenCode (Zen) | —（key 长期有效） | ✅ | ✅ | ✅ 填 API Key / 免登录 |
 | Qoder | — | — | — | 需 WASM 加密绕过 |
 | DeepSeek / ZCode | — | — | — | 待移植 |
 
 细节与踩坑记录见 [`docs/MILESTONES.md`](docs/MILESTONES.md)。
+
+### OpenCode (Zen) 的两个特殊点
+
+移植自本机 jethub 插件的 `dsh-codearts-auth`。它是标准 OpenAI 兼容端点，SSE 可原样透传，
+但有两处**漏掉就整条通道不可用**的硬要求：
+
+1. **免费（匿名）通道的形状门禁** —— 官方按请求体形状识别「是不是 OpenCode 客户端」：
+   必须 `stream: true`，且 `tools` 里同时存在名为 `bash` 与 `read` 的 function 工具。
+   不满足一律回 403 `FreeTierError`。网关会自动补这两个桩工具；
+   **只有在请求原本一个工具都没有时**才顺带补 `tool_choice: "none"`
+   （已有真实工具时覆盖它，会让模型无法调用任何工具）。
+2. **五个指纹头 + session id 形状** —— `x-opencode-project` / `x-opencode-session` /
+   `x-opencode-request` / `x-opencode-client: cli` / `user-agent`。
+   其中 session id 必须是 `ses_` + 12 位 hex + **14** 位 base62（尾段共 26 字符）。
+   官方源码里 `LENGTH = 26` 是**整段尾部长度**而非随机段长度，误读成「随机 26 位」
+   会产出 38 字符，付费通道照常、**匿名通道一律 403**，只有用免登录才暴露。
+
+免登录通道用字面量 `public` 作 API key（与官方 CLI 无 key 时的行为一致），在管理页
+OpenCode 卡片里点「免登录使用免费模型」即可添加，无需注册。免费模型共 7 个
+（big-pickle、space-bunny-free、longcat-2.5-preview-free、mimo-v2.6-flash-free、
+mimo-v2.5-free、nemotron-3-ultra-free、nemotron-3.5-lightning-free）。
+
+模型目录只暴露**实测可达**的 14 个模型：上游 `/zen/v1/models` 返回 84+ 条且不含协议信息，
+直接透传会让用户点到走 `/v1/messages`（Anthropic 协议，本项目未实现）的
+`claude-*` 与 `ling-*` 上，必然 404/401/500。表外模型一律不列出。
+
+错误分类遵循「额度语义先于鉴权」：`402` 或含 `Insufficient account funds` 归为
+**额度不足（去充值）**而不是服务端故障——归错会让用户反复重试一个永远不会成功的请求。
+`retry-after: 0` 是合法值（表示立即解除），必须与「没给这个头」区分开。
 
 ### 已修复的上游缺陷
 
 | 问题 | 现象 | 记录 |
 |---|---|---|
 | 个别章节预标注每轮必失败 | 第 250/251 章报 `canonical units overlap or are out of order`，永远标注不出来 | [`docs/OVERLAP-FIX.md`](docs/OVERLAP-FIX.md) |
+| 音频漫画配图整章被取消 | 单张图片过小/写坏时 `deliver()` 抛未捕获的 `IllegalArgumentException`，穿透到协程取消整章配图流水线 | 见下方「补丁脚本」 |
 
 ## 目录结构
 

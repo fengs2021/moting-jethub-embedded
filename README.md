@@ -132,36 +132,43 @@ Compose 生成的 lambda id，而不是靠行号。
 | CodeBuddy (Buddy) | ✅ | ✅ | ✅ | ✅ 浏览器轮询 |
 | WorkBuddy | ✅ | ✅ | ✅ | ✅ 浏览器轮询 |
 | MiniMax | ✅ | ✅ | ✅ | ✅ 设备码 + PKCE |
-| OpenCode (Zen) | —（key 长期有效） | ✅ | ✅ | ✅ 填 API Key / 免登录 |
+| OpenCode (Zen) | —（key 长期有效） | ✅ | ✅ | ✅ 填 API Key |
 | Qoder | — | — | — | 需 WASM 加密绕过 |
 | DeepSeek / ZCode | — | — | — | 待移植 |
 
 细节与踩坑记录见 [`docs/MILESTONES.md`](docs/MILESTONES.md)。
 
-### OpenCode (Zen) 的两个特殊点
+### OpenCode (Zen)
 
-移植自本机 jethub 插件的 `dsh-codearts-auth`。它是标准 OpenAI 兼容端点，SSE 可原样透传，
-但有两处**漏掉就整条通道不可用**的硬要求：
+移植自本机 jethub 插件的 `dsh-codearts-auth`。它是标准 OpenAI 兼容端点，SSE 可原样透传。
 
-1. **免费（匿名）通道的形状门禁** —— 官方按请求体形状识别「是不是 OpenCode 客户端」：
+> **⚠️ 匿名（免登录）通道已被服务端关闭，必须填真实 API Key。**
+> 2026-10-16 用真实端点实测：匿名槽（`Authorization: Bearer public`）无论请求体形状、
+> 请求头如何组合，一律返回 `403 FreeTierError`（"OpenCode's free tier can only be used
+> from within OpenCode"）。上游最新版 `dsh-codearts-auth@1.3.261015` 的服务端事实与本机
+> 移植完全一致，它自己也不再自动播种匿名账号。
+> 故本项目**不提供免登录入口**：管理页只接受真实 Key，留空会明确提示。
+> 免费档位（带「（免费）」后缀的模型）仍然存在，但**同样需要 Key**，只是不消耗余额。
+
+两处**漏掉就整条请求失败**的协议细节：
+
+1. **请求体形状门禁** —— 官方按请求体形状识别「是不是 OpenCode 客户端」：
    必须 `stream: true`，且 `tools` 里同时存在名为 `bash` 与 `read` 的 function 工具。
-   不满足一律回 403 `FreeTierError`。网关会自动补这两个桩工具；
-   **只有在请求原本一个工具都没有时**才顺带补 `tool_choice: "none"`
-   （已有真实工具时覆盖它，会让模型无法调用任何工具）。
+   网关会自动补这两个桩工具；**只有在请求原本一个工具都没有时**才顺带补
+   `tool_choice: "none"`（已有真实工具时覆盖它，会让模型无法调用任何工具）。
+   （门禁本身与匿名与否无关，实现里对认证通道也照补，避免走同一层检查时被拒。）
 2. **五个指纹头 + session id 形状** —— `x-opencode-project` / `x-opencode-session` /
-   `x-opencode-request` / `x-opencode-client: cli` / `user-agent`。
+   `x-opencode-request` / `x-opencode-client: cli` / `user-agent`；
+   **绝不能发** `x-session-affinity` / `X-Session-Id`。
    其中 session id 必须是 `ses_` + 12 位 hex + **14** 位 base62（尾段共 26 字符）。
    官方源码里 `LENGTH = 26` 是**整段尾部长度**而非随机段长度，误读成「随机 26 位」
-   会产出 38 字符，付费通道照常、**匿名通道一律 403**，只有用免登录才暴露。
+   会产出 38 字符。此错**只在匿名通道下暴露**（付费通道不校验），是移植期最难发现的一处。
 
-免登录通道用字面量 `public` 作 API key（与官方 CLI 无 key 时的行为一致），在管理页
-OpenCode 卡片里点「免登录使用免费模型」即可添加，无需注册。免费模型共 7 个
-（big-pickle、space-bunny-free、longcat-2.5-preview-free、mimo-v2.6-flash-free、
-mimo-v2.5-free、nemotron-3-ultra-free、nemotron-3.5-lightning-free）。
-
-模型目录只暴露**实测可达**的 14 个模型：上游 `/zen/v1/models` 返回 84+ 条且不含协议信息，
+模型目录只暴露**实测可达**的模型：上游 `/zen/v1/models` 返回 88 条且不含协议信息，
 直接透传会让用户点到走 `/v1/messages`（Anthropic 协议，本项目未实现）的
-`claude-*` 与 `ling-*` 上，必然 404/401/500。表外模型一律不列出。
+`claude-*` 等模型上，必然 404/401/500。因此维护一张显式表（12 条：5 条免费 + 7 条付费），
+表外模型一律不列出；远端已下架的条目也会同步剔除（`mimo-v2.5-free`、
+`nemotron-3-ultra-free` 即如此移除）。
 
 错误分类遵循「额度语义先于鉴权」：`402` 或含 `Insufficient account funds` 归为
 **额度不足（去充值）**而不是服务端故障——归错会让用户反复重试一个永远不会成功的请求。

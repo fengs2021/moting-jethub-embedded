@@ -519,3 +519,134 @@ CanonicalChapterUnitStore.exactUnitRecords(String chapterText, List<ExactUnit>) 
 | 全树回编 | `apktool b full-decoded` | exit 0，70272004 字节，dex 编号连续、包名不变 |
 
 完整定位过程另见 [`OVERLAP-FIX.md`](OVERLAP-FIX.md)。
+
+## 里程碑 13：移植 OpenCode (Zen) 平台
+
+对应需求：「墨听的平台代理还要加上 opencode 平台，你对照下本机的 jethub 插件看看，
+想办法移植进去。」
+
+参照物是本机 jethub 插件的 `dsh-codearts-auth`（已安装版本 `0.2.0-rc.10`，
+可比对源码在 PVE `/root/dsh-phone/vendor/dsh-codearts-auth/src/` 的 8 个 `opencode-*.ts`）。
+
+### ① 与其余五家的本质差别：不需要协议转换
+
+Zen 端点 `https://opencode.ai/zen/v1/chat/completions` 就是**标准 OpenAI chat 形状**，
+响应就是标准 OpenAI SSE。故本项目**没有新建 SseConverter**，流式直接透传；
+`aggregate` 只用于非流式聚合。
+
+登录形态也不同：**没有设备码 / 扫码流程**，凭据就是一条 `sk-…` API Key 直接填。
+`isExpired` 恒 `false`（长期凭据，无续期循环）。
+
+### ② 两处「漏掉就整条通道不可用」的协议细节
+
+1. **请求体形状门禁**：`stream` 必须 `true`，且 `tools` 里必须同时存在名为 `bash`
+   与 `read` 的 function 工具（描述、参数、请求头都不检查）。不满足回 403 `FreeTierError`。
+   网关自动补这两个桩工具，**只有在请求原本一个工具都没有时**才顺带补
+   `tool_choice: "none"` —— 已有真实工具时覆盖它，会让模型无法调用任何工具。
+
+2. **五个指纹头 + session id 形状**：
+   `x-opencode-project` / `x-opencode-session` / `x-opencode-request` /
+   `x-opencode-client: cli` / `user-agent`；**绝不发** `x-session-affinity` /
+   `X-Session-Id`（那是同函数里「非 opencode provider」分支的头）。
+
+   session id 必须是 `ses_` + 12 位小写 hex + **14** 位 base62（尾段共 26 字符）。
+   官方 `id/index.ts` 的 `const LENGTH = 26` 是**整段尾部长度**
+   （`randomBase62(LENGTH - 12)`），随机段是 14。误读成「随机 26 位」会产出
+   `ses_` + 38 字符 —— **此错只在匿名通道下暴露**（付费通道不校验形状），
+   是移植期最难发现的一处。
+
+   project id 用 `sha1("git-remote:opencode/" + sha256Hex(identity + " " + generation))`：
+   同身份稳定、换代次即变，满足「防关联但不参与配额计算」。
+
+### ③ 错误分类顺序即优先级
+
+额度语义必须**先于**鉴权判定，因为额度错误常带 401/403/429：
+
+```
+free_usage_limit → go_usage_limit → free_tier（不重试不换槽）
+→ rate_limit(429) → transport(status 0 或 fetch failed/terminated/econnreset/…)
+→ quota（402 或含 insufficient account funds / funds / balance）
+→ auth(401/403) → server(>=500) → 兜底 auth
+```
+
+`retry-after: 0` 是合法值（表示立即解除），必须用 `!== undefined` 与
+「没给这个头」区分开 —— 混同会让用户白等一轮。
+
+**402 必须单独归类成 quota**：付费 key 余额耗尽时上游回 402，
+若归成「服务端故障请重试」，用户会反复重试一个永远不会成功的请求。
+
+### ④ 模型目录只暴露实测可达的条目
+
+上游 `/zen/v1/models` 返回 **88 条**且不含协议信息，含 `claude-*` / `ling-*` 等走
+`/v1/messages`（Anthropic 协议，本项目未实现）的模型 —— 直接透传会让用户点到
+必然 404/401/500 的条目。故维护显式表（**12 条：5 免费 + 7 付费**），表外一律返回
+`isFree=false` / `isReachable=false`。
+
+### ⑤ 关键发现：匿名（免登录）通道已被服务端封死
+
+初次实现照搬插件逻辑，提供「免登录添加（免费模型）」入口（用字面量 `public` 作 key）。
+**真实端点探针（用本项目的 `OpencodeProvider` 原样打线上，非重写假设）实测：**
+
+| 用例 | 结果 |
+|---|---|
+| 匿名槽 + 完整门禁形状（stream + bash/read + tool_choice=none） | **403 `FreeTierError`** |
+| 匿名槽 + 去掉门禁形状 | 403 `FreeTierError`（证明门禁真实存在，且本实现的形状正是放行条件） |
+| 匿名槽 + 付费模型 | 401 `AuthError: Missing API key`（分类正确） |
+| 请求头逐项消融（含 `accept: text/event-stream`） | **全部 403，无一放行** |
+
+完全消融实验证明与请求头无关。进一步拉上游最新版 `dsh-codearts-auth@1.3.261015`
+比对：**服务端事实与本地移植完全一致**，其新增的 `opencode-auth.js` / `opencode-rpc.js`
+也把匿名通道当普通条目处理，**不再自动播种匿名账号**。
+
+⇒ **结论：匿名通道 403 是服务端现状，不是本移植的缺陷。**
+2026-10-02 起服务端从「按形状识别客户端」改为「只认 OpenCode 官方客户端本体」。
+
+**据此做的修正（第二次提交）：**
+
+| 位置 | 修正 |
+|---|---|
+| `OpencodeProvider.FALLBACK_MODELS` | 移除远端已下架两条：`mimo-v2.5-free`、`nemotron-3-ultra-free`（远端 88 条里查无此 id） |
+| `AccountManager` | 删除 `ensureDefaultOpencodeAccount()` 播种调用及方法；`Boot.java` 同步删除调用 |
+| `GatewayServer` 管理端点 | 空 key 由「即免登录」改为 **400 错误**，文案说明「免费档位模型同样需要 Key」 |
+| `GatewayServer` 模型目录 | 注释与逻辑改为「有 key 才列出」，不再声称零配置可用 |
+| `home.html` | **删除「免登录添加（免费模型）」按钮**；`onOpencodeAdd(node)` 去掉 `anonymous` 形参，留空直接 toast 提示；占位符改「sk-…（必填）」；`PROVIDERS` 的 note 改「API Key」 |
+| `AccountManager` 标签 | 匿名槽标签显示「匿名通道（已失效）」——否则用户看到正常标签却条条失败，会误判成自己网络问题 |
+| `README.md` | 「免登录」宣传全部撤下，改为显式警告块 + 实测证据 |
+| `RegTest` | 新增下架条目断言（`isReachable` 必须为 false） |
+
+**保留的部分**（有意为之）：形状门禁与指纹代码**不动**。一旦上游放宽，
+无需改动即可恢复；对带 key 的认证通道也无害。
+
+### ⑥ 离线断言验证不了假设本身 —— 这是本里程碑最大的教训
+
+`RegTest` 的 10 组 OpenCode 断言**全部通过**，但它们只证明「我实现的假设自洽」，
+**证明不了假设与线上一致**。匿名通道的 FreeTier 门禁属**未公开行为**，
+只能靠真实端点证伪。探针的价值正在于此：它不复现实现，而是直接编译并调用
+**真实的** `jet.core.OpencodeProvider`（`headers` / `deriveSessionId` / `buildPayload` /
+`ensureFreeLaneShape` / `classifyError` / `aggregate`），因此测的是线上事实而非我的推理。
+
+> 若当初只跑离线断言就交付，用户拿到的会是一个「有免登录入口、点进去条条 403」的包。
+
+### ⑦ 验证结果
+
+| 层 | 内容 | 结果 |
+|---|---|---|
+| 编译 | `javac src/jet`（android-34.jar + json.jar） | 67 个 class，exit 0 |
+| 回归 | `java RegTest` | **REG PASS**（含 10 组 OpenCode 断言） |
+| 前端 | 抽取内联 JS → `node --check` | `JS_SYNTAX_OK`（67543 字节） |
+| 真实端点 | `.oc-probe/` 探针（复用真实 Provider 打线上） | 5 项用例，匿名通道 403 定案 |
+| 全树回编 | `bash scripts/build-full.sh` | exit 0，70603414 字节 |
+| 二进制核验 | `bash tools/verify-apk.sh` | 全绿（见下） |
+
+### ⑧ 交付产物指纹
+
+| 项 | 值 |
+|---|---|
+| 文件 | `墨听-4.0.20-r2-jethub内置版.apk` |
+| 大小 | 70603414 字节 |
+| sha256 | `05adeb3bf67f7a50224d427e5f9802b0c4e1b0187efb5ce3696e8ca18f6071fc` |
+| dex 分包 | `classes.dex` … `classes10.dex`，编号 1..10 连续 |
+| 关键类落位 | `jet/core/OpencodeProvider.smali`（31 个方法）、`AccountManager$OpencodeIdentity.smali` → `classes9.dex` |
+| 包身份 | `com.jethub.moting` / versionCode 40023 / versionName 4.0.20-r2 / targetSdk 34 |
+| 应用名 | 墨听JetHub |
+| 签名 | CN=JetHub Embedded, OU=Dev, O=JetHub, C=CN，SHA-256 `3f0e1b4d…5e15f73` |

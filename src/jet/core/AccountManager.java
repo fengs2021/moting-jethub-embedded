@@ -59,8 +59,8 @@ public final class AccountManager {
         PROVIDERS.add(new Meta(P_MINIMAX, "MiniMax", "设备码登录", true));
         // ⚠️ OpenCode 无签到活动也无余额接口，checkin 必须 false，否则界面会出现
         // 一个永远失败的签到按钮。它的登录形态也与其余五家不同：不是设备码/扫码，
-        // 而是**直接填 API key**（且可留空走匿名通道，用字面量 public 当 key）。
-        PROVIDERS.add(new Meta(P_OPENCODE, "OpenCode", "API Key（可留空免登录）", false));
+        // 而是**直接填 API key**（匿名通道已被服务端封死，必须真实 key）。
+        PROVIDERS.add(new Meta(P_OPENCODE, "OpenCode", "API Key", false));
     }
 
     /** 余额/签到缓存有效期：避免每次开页面都打 5 家上游。 */
@@ -170,32 +170,6 @@ public final class AccountManager {
 
     public OpencodeProvider opencode(String accountId) {
         return new OpencodeProvider(view(P_OPENCODE, accountId));
-    }
-
-    /**
-     * 保证 OpenCode 至少有一条账号，让用户在**完全没配任何 key** 时也能用它。
-     *
-     * <p>OpenCode 的免费模型走匿名通道（{@code Authorization: Bearer public}），
-     * 所以「零账号」本该可用；但本项目的 Provider 一律要求桶里有一条凭据，
-     * 否则 {@code ensureFresh()} 直接抛未配置。这里补一条匿名账号补上这个缺口。
-     *
-     * <p><b>幂等且尊重删除</b>：只在桶<b>一条账号都没有</b>时补。
-     * 用户删掉匿名条目、只留自己的付费 key，之后重启不会又被塞回来；
-     * 想再要匿名通道，在界面上手动加一条 key 填 {@code public} 即可。
-     */
-    public void ensureDefaultOpencodeAccount() {
-        try {
-            AccountStore b = buckets.get(P_OPENCODE);
-            if (b == null) return;
-            if (!b.load().accounts.isEmpty()) return;
-            JSONObject p = new JSONObject();
-            p.put("api_key", OpencodeProvider.ANONYMOUS_KEY);
-            p.put("nickname", "");
-            p.put("generation", 0);
-            b.upsert(p, null);
-        } catch (Exception ignored) {
-            // 存储不可写不该拖垮网关启动
-        }
     }
 
     /** 按活跃账号造 Provider（聊天/列模型走它）。 */
@@ -768,7 +742,9 @@ public final class AccountManager {
             String key = p.optString("api_key", "");
             if (OpencodeProvider.ANONYMOUS_KEY.equals(key)) {
                 String n = p.optString("nickname", "");
-                return n.isEmpty() ? "匿名通道（免登录）" : "匿名通道 · " + n;
+                // ⚠️ 匿名通道已被服务端封死：标签必须标出「已失效」，
+                //    否则用户看到一条正常标签的账号却条条失败，会以为是自己网络问题。
+                return n.isEmpty() ? "匿名通道（已失效）" : "匿名通道（已失效）· " + n;
             }
             String n = p.optString("nickname", "");
             if (!n.isEmpty()) return n;

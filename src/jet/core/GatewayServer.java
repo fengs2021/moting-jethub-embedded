@@ -425,13 +425,14 @@ public final class GatewayServer {
             } else if ("/jethub/models".equals(path)) {
                 sendJson(out, 200, modelsJson(query).toString());
             } else if ("/jethub/opencode/key".equals(path) && "POST".equals(method)) {
-                // OpenCode 没有设备码 / 扫码流程，凭据是一条 API Key；
-                // 匿名通道（免登录）用字面量 public。
+                // OpenCode 没有设备码 / 扫码流程，凭据就是一条 API Key。
+                // ⚠️ 匿名通道（Bearer public）已被服务端封死（2026-10-16 实测），
+                //    故这里不再接受空 key —— 必须给出真实 Key，否则用户会以为配好了。
                 JSONObject req = body == null || body.trim().isEmpty() ? new JSONObject() : new JSONObject(body);
                 String key = req.optString("api_key", "").trim();
                 String nickname = req.optString("nickname", "").trim();
                 if (key.isEmpty()) {
-                    sendJson(out, 400, errorJson("请填写 API Key（免登录使用请填 public）"));
+                    sendJson(out, 400, errorJson("请填写 OpenCode API Key（免费档位模型同样需要 Key）"));
                 } else {
                     AccountStore b = accounts.bucket(AccountManager.P_OPENCODE);
                     if (b == null) {
@@ -448,7 +449,6 @@ public final class GatewayServer {
                         ok.put("ok", true);
                         ok.put("id", saved == null ? "" : saved.id);
                         ok.put("label", saved == null ? "" : saved.label);
-                        ok.put("anonymous", OpencodeProvider.ANONYMOUS_KEY.equals(key));
                         sendJson(out, 200, ok.toString());
                     }
                 }
@@ -785,8 +785,9 @@ public final class GatewayServer {
             // 未登录 minimax：跳过
         }
         // OpenCode 模型。⚠️ 它的 listModels 内部已经把远端目录按可达性过滤过
-        // （远端 /v1/models 返回 84+ 个含 claude-*/gpt-* 等我们未实现协议的模型），
-        // 且失败时自带兜底表 ⇒ 未配置任何 key 也能列出免登录可用的免费模型。
+        // （远端 /v1/models 返回 84+ 个含 claude-*/gpt-* 等我们未实现协议的模型）。
+        // ⚠️ 匿名通道已被服务端封死（2026-10-16 实测），故配置了有效 API Key
+        // 才会列出模型；未配置时这里会跳过（不再有「零配置免登录可用」这条路）。
         // provider 为 null 只发生在不传 AccountManager 的旧测试构造器下。
         if (opencode != null) {
             try {
@@ -1109,11 +1110,11 @@ public final class GatewayServer {
      * 永远不会成功的请求。
      */
     private static String opencodeErrorMessage(OpencodeProvider.ErrorInfo info, OpencodeProvider.Credential c) {
-        String who = c.isAnonymous() ? "匿名通道（免登录）" : "当前账号";
+        String who = c.isAnonymous() ? "匿名通道" : "当前账号";
         String detail = info.detail == null || info.detail.isEmpty() ? "" : "：" + info.detail;
         if (OpencodeProvider.KIND_FREE_USAGE_LIMIT.equals(info.kind)) {
             return "OpenCode 免费额度今日已用尽（" + who + "）" + detail
-                    + " —— 明日恢复，或添加一个付费 API Key 继续。";
+                    + " —— 明日恢复，或换一个 API Key 继续。";
         }
         if (OpencodeProvider.KIND_GO_USAGE_LIMIT.equals(info.kind)) {
             return "OpenCode 当日额度已用尽（" + who + "）" + detail + " —— 请等待额度恢复。";
@@ -1130,9 +1131,11 @@ public final class GatewayServer {
                     + " —— 该模型可能需要付费 Key，或 Key 已失效。";
         }
         if (OpencodeProvider.KIND_FREE_TIER.equals(info.kind)) {
-            // 形状门禁拒绝：这是本项目内部的形状问题，不是用户配置错，须明确说出来
-            return "OpenCode 拒绝了本次请求的形态（FreeTier）" + detail
-                    + " —— 若反复出现请反馈，这是本网关的兼容性问题。";
+            // 匿名通道已被服务端封死（2026-10-16 实测，权威参考实现同样如此）。
+            // 这是用户的配置缺失，不是本网关的兼容性问题 —— 必须直接告诉他去填 Key，
+            // 说成「本网关 bug 请反馈」会让他白等一个不会来的修复。
+            return "OpenCode 匿名通道已被服务端关闭（FreeTier）" + detail
+                    + " —— 请到 opencode.ai 申请 API Key 填入本卡片后再试。";
         }
         if (OpencodeProvider.KIND_TRANSPORT.equals(info.kind)) {
             return "无法连接 OpenCode" + detail + " —— 请检查网络或代理。";

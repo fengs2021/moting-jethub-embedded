@@ -733,7 +733,7 @@ footer.ft .sep{opacity:.4;margin:0 6px}
     { id: 'buddy',     name: 'CodeBuddy',  note: '浏览器授权',   checkin: true,  kind: 'buddy',     mark: 'B' },
     { id: 'workbuddy', name: 'WorkBuddy',  note: '浏览器授权',   checkin: false, kind: 'workbuddy', mark: 'W' },
     { id: 'minimax',   name: 'MiniMax',    note: '设备码登录',   checkin: true,  kind: 'minimax',   mark: 'M' },
-    { id: 'opencode',  name: 'OpenCode',   note: 'API Key（留空免登录）', checkin: false, kind: 'opencode', mark: 'O', keyOnly: true }
+    { id: 'opencode',  name: 'OpenCode',   note: 'API Key', checkin: false, kind: 'opencode', mark: 'O', keyOnly: true }
   ];
 
   var CHECKIN_LABEL = {
@@ -981,7 +981,7 @@ footer.ft .sep{opacity:.4;margin:0 6px}
       return req(path, 'POST', {});
     },
     logout: function () { return req('/logout', 'POST', {}); },
-    // OpenCode 没有设备码 / 扫码流程，凭据就是一条 API Key（免登录填 public）
+    // OpenCode 没有设备码 / 扫码流程，凭据就是一条 API Key（匿名通道已失效，必须真实 key）
     opencodeKey: function (key, nickname) {
       return req('/opencode/key', 'POST', { api_key: key, nickname: nickname });
     }
@@ -1285,7 +1285,7 @@ footer.ft .sep{opacity:.4;margin:0 6px}
 
     if (list.length === 0) {
       h += '<div class="empty">' + icon('i-user')
-        + '<b>尚未添加账号</b><p>' + (pv.keyOnly ? '在下方填入 API Key，或直接免登录使用免费模型' : '点击下方按钮开始登录') + '</p></div>';
+        + '<b>尚未添加账号</b><p>' + (pv.keyOnly ? '在下方填入 OpenCode API Key' : '点击下方按钮开始登录') + '</p></div>';
     } else {
       for (var j = 0; j < list.length; j++) {
         if (!isObj(list[j])) continue;
@@ -1297,18 +1297,18 @@ footer.ft .sep{opacity:.4;margin:0 6px}
 
     if (pv.keyOnly) {
       // OpenCode：没有设备码 / 扫码流程，凭据是一条 API Key。
-      // 留空即免登录（服务端用字面量 public 走匿名通道，只能用免费模型）。
+      // ⚠️ 匿名（免登录）通道已被服务端封死（2026-10-16 实测：一律 403 FreeTierError），
+      //    故这里只保留真实 Key 入口，不再提供「免登录」按钮 —— 留着它只会让用户
+      //    添加一条必然失败的通道。
       h += '<div style="margin-top:11px">'
         + '<div class="lbl">API Key</div>'
         + '<input class="inp" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" '
-        + 'spellcheck="false" data-oc-key="1" placeholder="sk-…（留空则免登录，仅免费模型）">'
+        + 'spellcheck="false" data-oc-key="1" placeholder="sk-…（必填）">'
         + '<input class="inp" type="text" autocomplete="off" data-oc-nick="1" placeholder="备注名（可选，多个 Key 时便于区分）">'
-        + '<p class="hint">免登录通道只能用带「（免费）」后缀的模型，且按出口 IP 限速；'
-        + '要使用付费模型请到 opencode.ai 生成 API Key 填入。</p>'
+        + '<p class="hint">带「（免费）」后缀的模型不消耗余额，但<b>同样需要 API Key</b>；'
+        + '到 opencode.ai 生成后填入。</p>'
         + '<button type="button" class="btn wide" data-oc-add="1" data-provider="' + esc(pv.id) + '">'
         + icon('i-plus') + '<span>添加 API Key</span></button></div>';
-      h += '<div style="margin-top:8px"><button type="button" class="btn wide gho" data-oc-free="1" '
-        + 'data-provider="' + esc(pv.id) + '">' + icon('i-cloud') + '<span>免登录添加（免费模型）</span></button></div>';
     } else {
       h += '<div style="margin-top:11px">'
         + '<button type="button" class="btn wide" data-flow-act="start" data-provider="' + esc(pv.id) + '"'
@@ -2365,9 +2365,7 @@ footer.ft .sep{opacity:.4;margin:0 6px}
           var cf = node.getAttribute('data-confirm');
           var cp = node.getAttribute('data-copy-btn');
           var ocAdd = node.getAttribute('data-oc-add');
-          var ocFree = node.getAttribute('data-oc-free');
-          if (ocAdd) { ev.preventDefault(); onOpencodeAdd(node, false); return; }
-          if (ocFree) { ev.preventDefault(); onOpencodeAdd(node, true); return; }
+          if (ocAdd) { ev.preventDefault(); onOpencodeAdd(node); return; }
           if (act) { ev.preventDefault(); onAct(node, act); return; }
           if (fa) { ev.preventDefault(); onFlow(node, fa); return; }
           if (ckA) { ev.preventDefault(); onCk(node); return; }
@@ -2459,25 +2457,24 @@ footer.ft .sep{opacity:.4;margin:0 6px}
 
   /**
    * OpenCode 添加凭据（没有设备码流程，直接写 API Key）。
-   * 免登录按钮传 key='public'，与官方 CLI 无 key 时的行为一致。
+   * ⚠️ 匿名通道已被服务端封死，故这里**只接受真实 Key**；留空直接提示，不静默降级。
    */
-  function onOpencodeAdd(node, anonymous) {
+  function onOpencodeAdd(node) {
     var provider = s(node.getAttribute('data-provider')) || 'opencode';
     var card = closestByClass(node, 'prov', 8);
     var keyEl = card ? card.querySelector('[data-oc-key]') : null;
     var nickEl = card ? card.querySelector('[data-oc-nick]') : null;
-    var key = anonymous ? 'public' : (keyEl ? s(keyEl.value) : '');
+    var key = keyEl ? s(keyEl.value) : '';
     var nickname = nickEl ? s(nickEl.value) : '';
-    if (!anonymous && !key) {
-      // 用户点了「添加 API Key」但留空 —— 按提示语义视为免登录，避免卡在报错上
-      anonymous = true;
-      key = 'public';
+    if (!key) {
+      toast('err', '请填写 OpenCode API Key（免费模型也需要）');
+      return;
     }
     busy(node, true);
     api.opencodeKey(key, nickname).then(function (res) {
       if (keyEl) keyEl.value = '';
       if (nickEl) nickEl.value = '';
-      toast('ok', anonymous ? '已添加免登录通道' : '已添加 API Key');
+      toast('ok', '已添加 API Key');
       return loadAccounts().then(function () { loadCredits(true); });
     })['catch'](function (e) {
       toast('err', '添加失败：' + errText(e));

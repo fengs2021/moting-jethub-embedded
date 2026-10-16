@@ -201,7 +201,14 @@ public class RegTest {
         if (!OpencodeProvider.displayName("big-pickle").contains("免费")) {
             throw new AssertionError("免费模型展示名应带「（免费）」");
         }
-        System.out.println("OpenCode-模型表: 免费/可达判定与展示名正确");
+        // ⚠️ 2026-10-16 实测已从远端 /v1/models 下架的两条必须移除，否则用户会点到必然 404 的模型
+        if (OpencodeProvider.isReachable("mimo-v2.5-free")) {
+            throw new AssertionError("mimo-v2.5-free 已被远端下架，不应再暴露");
+        }
+        if (OpencodeProvider.isReachable("nemotron-3-ultra-free")) {
+            throw new AssertionError("nemotron-3-ultra-free 已被远端下架，不应再暴露");
+        }
+        System.out.println("OpenCode-模型表: 免费/可达判定与展示名正确（含下架项已剔除）");
 
         // ⑨ 非流式聚合：标准 OpenAI SSE → 标准非流式响应
         String sse = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你\"}}]}\n\n"

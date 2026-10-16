@@ -15,17 +15,32 @@ import java.util.Map;
  *
  * <h3>与其余五家最大的不同：它是标准 OpenAI 兼容</h3>
  * 请求体就是 OpenAI chat 形状，响应就是标准 OpenAI SSE，**不需要协议转换**。
- * 但有两道「形状门禁」必须原样复刻，否则匿名通道一律 403：
+ *
+ * <h3>⚠️ 匿名（免登录）通道已被服务端封死 —— 必须配真实 API Key</h3>
+ * 2026-10-16 用真实端点实测：匿名槽（{@code Authorization: Bearer public}）
+ * <b>一律</b>回 {@code 403 FreeTierError}（"OpenCode's free tier can only be used
+ * from within OpenCode"）。这不是本移植的缺陷 —— 权威参考实现
+ * {@code dsh-codearts-auth}（含最新 1.3.261015）在同样形状下同样 403，
+ * 且其源码注释已明说「伪装需跟进上游更新」。故：
+ * <ul>
+ *   <li><b>不再自动播种匿名账号</b>（见 {@code AccountManager}）：播种只会让用户
+ *       看到一张可用模型表却条条失败，不如直接要求填 key。</li>
+ *   <li>下方形状与指纹代码<b>保留</b>：一旦上游放宽，无需改动即可恢复；
+ *       对带 key 的认证通道也无害。</li>
+ * </ul>
+ *
+ * <h3>保留的两道「形状门禁」</h3>
  *
  * <ol>
  *   <li><b>指纹头</b>：{@code x-opencode-project} / {@code x-opencode-session} /
  *       {@code x-opencode-request} / {@code x-opencode-client} / {@code user-agent}。
  *       真实 CLI（1.18.22）只发这五项；<b>不发</b> {@code x-session-affinity} 与
  *       {@code X-Session-Id}（那是同函数里「非 opencode provider」分支的头）。</li>
- *   <li><b>FreeTier 形状门禁</b>：匿名通道（{@code Bearer public}）拒绝不带
- *       agent 形状的 body，回 403 FreeTierError —— 除非 {@code stream:true}
- *       <b>且</b> {@code tools} 里存在名为 {@code bash} 与 {@code read} 的
- *       function 工具（描述/参数/请求头都不检查）。见 {@link #ensureFreeLaneShape}。</li>
+ *   <li><b>FreeTier 形状门禁</b>：匿名通道拒绝不带 agent 形状的 body，回 403
+ *       FreeTierError —— 除非 {@code stream:true} <b>且</b> {@code tools} 里存在
+ *       名为 {@code bash} 与 {@code read} 的 function 工具（描述/参数/请求头都不检查）。
+ *       见 {@link #ensureFreeLaneShape}。实测该形状<b>已不足以放行</b>（同上），
+ *       但保留以便上游放宽后立即复活。</li>
  * </ol>
  *
  * <h3>session id 的形状不是随意选的</h3>
@@ -354,23 +369,24 @@ public final class OpencodeProvider {
      * 兜底模型表（以真机实测为准）。
      *
      * <p>每条 {@code {id, 展示名, 是否免费}}。{@code 是否免费}的含义是
-     * 「<b>匿名通道</b>（{@code Bearer public}）能否使用」，不是官方定价表的 Free 标记。
+     * 「官方定价为 0（不消耗账户余额）」，仍是<b>需配 API Key 才能调用</b> ——
+     * 匿名通道已被封（见类注释），免费档位不再等于「免登录」。
      *
      * <p>⚠️ {@code ling-3.0-flash-fin-free} 已移除：它走 {@code /v1/messages}
      * （Anthropic 协议，我们未实现），chat 端点 404 ⇒ 两条通道都不可用，
      * 留在目录里只会让用户点到一个必然失败的模型。
      */
     static final String[][] FALLBACK_MODELS = {
-            // ── 匿名可用（chat 端点，无需 key）──
+            // ── 免费档位（官方定价为 0）──
+            // ⚠️ 2026-10-16 实测从远端 /v1/models 已下架两条：mimo-v2.5-free、
+            //    nemotron-3-ultra-free（远端 88 条里查无此 id），留着只会让用户
+            //    点到一个必然 404 的模型，已移除。
             {"big-pickle", "Big Pickle", "1"},
             {"space-bunny-free", "Space Bunny Free", "1"},
             {"longcat-2.5-preview-free", "LongCat 2.5 Preview Free", "1"},
             {"mimo-v2.6-flash-free", "MiMo-V2.6-Flash Free", "1"},
-            {"mimo-v2.5-free", "MiMo-V2.5 Free", "1"},
-            // 官方 docs 标注走 /v1/models/{id}（Gemini 风格），但实测 chat 端点也通
-            {"nemotron-3-ultra-free", "Nemotron 3 Ultra Free", "1"},
             {"nemotron-3.5-lightning-free", "Nemotron 3.5 Lightning Free", "1"},
-            // ── 需付费 key（chat 端点；实测匿名为 401）──
+            // ── 需 API Key ──
             {"deepseek-v4-flash", "DeepSeek V4 Flash", "0"},
             {"deepseek-v4.1-flash", "DeepSeek V4.1 Flash", "0"},
             {"glm-5.2", "GLM 5.2", "0"},
@@ -381,10 +397,10 @@ public final class OpencodeProvider {
     };
 
     /**
-     * 该模型是否属免费（匿名槽只接受免费模型）。
+     * 该模型是否属免费档位（官方定价为 0）。
      *
-     * <p>⚠️ <b>表外一律 false</b>：远端目录含大量表外模型，未实测前放给匿名槽
-     * 只会换来 403/500；宁可要求用户配一个付费账号。
+     * <p>⚠️ <b>表外一律 false</b>：远端目录含大量表外模型，未实测前放出来
+     * 只会换来 403/500；宁可要求用户配一个可用账号。
      */
     public static boolean isFree(String id) {
         for (String[] m : FALLBACK_MODELS) if (m[0].equals(id)) return "1".equals(m[2]);

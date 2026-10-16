@@ -13,7 +13,7 @@
 #   [5] d8 把 jet/** 打成 dex，baksmali 成 smali_classes9
 #   [6] 打补丁（幂等）：胶水类 / manifest 注册 / 菜单注入 / Boot 注入 / 刷新补丁 /
 #       预标注区间收敛（canonical units overlap 修复）
-#   [7] 改包名（可选，JETHUB_PACKAGE）
+#   [7] 改包名（可选，JETHUB_PACKAGE）+ 改应用显示名
 #   [8] apktool b 全量回编
 #   [9] zipalign + apksigner
 #
@@ -21,7 +21,8 @@
 #
 # 环境变量（括号内为默认值）：
 #   JETHUB_UPSTREAM_APK  原始墨听 APK（默认自动下载到 ./upstream/；想用别的版本就指过来）
-#   ANDROID_BUILD_TOOLS  build-tools 目录（默认 ./sdk/build-tools/34.0.0）
+#   ANDROID_BUILD_TOOLS  build-tools 目录（默认先找 ./sdk/build-tools/34.0.0，再回退到
+#                        系统 SDK（ANDROID_SDK_ROOT / ANDROID_HOME）里版本最高的一个）
 #   JETHUB_TOOLCHAIN     toolchain 目录（默认 ./toolchain）
 #   JETHUB_DECODED       apktool 解包出来的反编译树（默认 ./full-decoded）
 #   JETHUB_SMALI_TOOL    smali/baksmali 的 jar（默认 $JETHUB_TOOLCHAIN/baksmali.jar）
@@ -30,6 +31,10 @@
 #   JETHUB_KS_PASS       密钥库口令（提供 keystore 时必填）
 #   JETHUB_KEY_PASS      私钥口令（默认与 JETHUB_KS_PASS 相同）
 #   JETHUB_PACKAGE       改成这个包名（默认不改，沿用上游包名）
+#   JETHUB_APP_LABEL     桌面显示名（默认 墨听JetHub；传空串可关掉这一步）
+#   JETHUB_APP_LABEL_ALL_LOCALES=1
+#                        连 values-zh-rCN/rHK/rTW 一起改。不设时只改默认资源
+#                        res/values/strings.xml，与历史成品做法一致
 #   JETHUB_OUT           产物文件名（默认 墨听-4.0.20-jethub内置版.apk）
 #   JETHUB_SKIP_DEPS=1   跳过自动拉依赖（依赖已就绪时省时间）
 #
@@ -37,6 +42,12 @@
 #   bash scripts/build-full.sh
 # 默认会自己把工具链与原始墨听 APK 都拉下来，所以裸跑就行。
 # 想指定上游版本：JETHUB_UPSTREAM_APK=/path/to/墨听.apk bash scripts/build-full.sh
+#
+# Windows（Git Bash）说明：
+#   build-tools 的 d8 与 apksigner 在 Windows 上只有 .bat，没有无扩展名的可执行文件，
+#   脚本已通过 jethub_d8 / jethub_apksigner 改走 java 直调 lib/*.jar，无需手工干预；
+#   但 fetch-deps.sh 拉的是 Linux 版 build-tools，Windows 上必须复用系统 SDK，例如：
+#     ANDROID_BUILD_TOOLS=/d/Android/android-sdk/build-tools/35.0.0 bash scripts/build-full.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -107,7 +118,7 @@ else
 fi
 echo "  现有最大分包后 → $(basename "$JET_DIR")"
 rm -rf build/dex build/smali9 && mkdir -p build/dex
-"$ANDROID_BUILD_TOOLS/d8" --release --min-api 29 \
+jethub_d8 --release --min-api 29 \
   --lib "$TOOLCHAIN/android-34.jar" --output build/dex $(find build/classes/jet -name '*.class')
 rm -rf "$JET_DIR"
 java $JETHUB_JAVA_OPTS -Xmx3g -jar "$BAKSMALI" d build/dex/classes.dex -o "$JET_DIR"
@@ -123,26 +134,40 @@ python3 patches/patch-refresh.py "$DECODED"
 # 详见 docs/OVERLAP-FIX.md。
 python3 patches/patch-overlap.py "$DECODED"
 
-echo "[7/9] 改包名"
+echo "[7/9] 改包名 / 改应用显示名"
 # 默认不改：改名后是另一个应用，不继承原版墨听的数据，属于分发决策而非构建细节。
 if [ -n "${JETHUB_PACKAGE:-}" ]; then
   python3 patches/patch-package.py "$DECODED" "$JETHUB_PACKAGE"
 else
   echo "  （跳过：未设 JETHUB_PACKAGE，产出包名沿用上游）"
 fi
+# 桌面显示名。历史成品「墨听-4.0.20-overlap修复版.apk」只改了默认资源
+# res/values/strings.xml，所以本脚本默认也保持一致；中文设备要看到改名得加
+# JETHUB_APP_LABEL_ALL_LOCALES=1（会连 values-zh-rCN/rHK/rTW 一起改）。
+# 传 JETHUB_APP_LABEL= 空串可完全关掉这一步。
+APP_LABEL="${JETHUB_APP_LABEL-墨听JetHub}"
+if [ -n "$APP_LABEL" ]; then
+  if [ -n "${JETHUB_APP_LABEL_ALL_LOCALES:-}" ]; then
+    python3 patches/patch-label.py "$DECODED" "$APP_LABEL" --all-locales
+  else
+    python3 patches/patch-label.py "$DECODED" "$APP_LABEL"
+  fi
+else
+  echo "  （跳过应用名：JETHUB_APP_LABEL 为空）"
+fi
 
 echo "[8/9] apktool 回编整个 APK"
 java $JETHUB_JAVA_OPTS -jar "$TOOLCHAIN/apktool.jar" b -f --use-aapt2 "$DECODED" -o apk/built-full.apk 2>&1 | tail -1
 
 echo "[9/9] zipalign + apksigner"
-"$ANDROID_BUILD_TOOLS/zipalign" -p -f 4 apk/built-full.apk apk/aligned-full.apk
+jethub_zipalign -p -f 4 apk/built-full.apk apk/aligned-full.apk
 if [ -n "${JETHUB_KEYSTORE:-}" ]; then
   : "${JETHUB_KS_PASS:?设置了 JETHUB_KEYSTORE 就必须给 JETHUB_KS_PASS}"
-  "$ANDROID_BUILD_TOOLS/apksigner" sign \
+  jethub_apksigner sign \
     --ks "$JETHUB_KEYSTORE" --ks-key-alias "${JETHUB_KS_ALIAS:-jethub}" \
     --ks-pass "pass:$JETHUB_KS_PASS" --key-pass "pass:${JETHUB_KEY_PASS:-$JETHUB_KS_PASS}" \
     --out "$OUT" apk/aligned-full.apk
-  "$ANDROID_BUILD_TOOLS/apksigner" verify "$OUT"
+  jethub_apksigner verify "$OUT"
 else
   cp apk/aligned-full.apk "$OUT"
   echo "  未设置 JETHUB_KEYSTORE，产出未签名 APK（只能本地验证，不能安装分发）"

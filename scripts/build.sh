@@ -26,7 +26,8 @@
 #   JETHUB_SMALI_TOOL    smali.jar（默认 $JETHUB_TOOLCHAIN/smali.jar）
 #   JETHUB_KEYSTORE      签名密钥库（不提供则产出未签名 APK）
 #   JETHUB_KS_ALIAS / JETHUB_KS_PASS / JETHUB_KEY_PASS / JETHUB_OUT  同 build-full.sh
-#   ANDROID_BUILD_TOOLS  build-tools 目录（默认自举到 ./sdk/build-tools/34.0.0）
+#   ANDROID_BUILD_TOOLS  build-tools 目录（默认先找 ./sdk/build-tools/34.0.0，
+#                        再回退到系统 SDK 里版本最高的一个）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -112,14 +113,14 @@ print('rebuild ok')
 EOF
 
 echo "== 6/6 对齐 + 签名 =="
-"$ANDROID_BUILD_TOOLS/zipalign" -p -f 4 apk/moting-patched-unsigned.apk apk/moting-patched-aligned.apk
+jethub_zipalign -p -f 4 apk/moting-patched-unsigned.apk apk/moting-patched-aligned.apk
 if [ -n "${JETHUB_KEYSTORE:-}" ]; then
   : "${JETHUB_KS_PASS:?设置了 JETHUB_KEYSTORE 就必须给 JETHUB_KS_PASS}"
-  "$ANDROID_BUILD_TOOLS/apksigner" sign \
+  jethub_apksigner sign \
     --ks "$JETHUB_KEYSTORE" --ks-key-alias "${JETHUB_KS_ALIAS:-jethub}" \
     --ks-pass "pass:$JETHUB_KS_PASS" --key-pass "pass:${JETHUB_KEY_PASS:-$JETHUB_KS_PASS}" \
     --out "$OUT" apk/moting-patched-aligned.apk
-  "$ANDROID_BUILD_TOOLS/apksigner" verify "$OUT"
+  jethub_apksigner verify "$OUT"
 else
   cp apk/moting-patched-aligned.apk "$OUT"
   echo "  未设置 JETHUB_KEYSTORE，产出未签名 APK"

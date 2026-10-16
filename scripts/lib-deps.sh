@@ -6,13 +6,20 @@
 # 所以这段逻辑只写一份。
 #
 # 不直接执行，只提供函数：
-#   ensure_deps <jar 名单>
+#   ensure_deps <jar 名单> [want_upstream]
+#   jethub_next_dex_slot <反编译树根>
+#   jethub_upstream_apk
+#   jethub_resolve_build_tools      定位 build-tools 目录
+#   jethub_check_build_tools <目录> 校验 d8/apksigner/zipalign 是否齐
+#   jethub_d8 / jethub_apksigner / jethub_zipalign
+#                                   跨平台调用三个 build-tools 组件
 #
 # 调用约定：调用者已 cd 到仓库根、且已 set -euo pipefail。
 
 JETHUB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOLCHAIN="${JETHUB_TOOLCHAIN:-$JETHUB_ROOT/toolchain}"
 SDK="${JETHUB_SDK:-$JETHUB_ROOT/sdk}"
+# 首选版本；找不到时由 jethub_resolve_build_tools 回退到系统 SDK 里的其它版本。
 BT_VERSION="34.0.0"
 
 # ---------------------------------------------------------------- 字符集兜底
@@ -88,6 +95,99 @@ jethub_upstream_apk() {
   return 0
 }
 
+# ------------------------------------------------------- 跨平台 build-tools 抽象
+# build-tools 在不同平台上形态不同，脚本里不能直接拼 "$ANDROID_BUILD_TOOLS/d8"：
+#
+#   Linux/macOS : d8、apksigner、zipalign 都是可执行文件，直接调用。
+#   Windows     : 只有 d8.bat 与 apksigner.bat —— **没有无扩展名的 d8 / apksigner**。
+#                 Git Bash 里 `[ -x "$BT/d8" ]` 为假，直接调用报
+#                   No such file or directory   （退出码 127）
+#                 zipalign 反而有原生 zipalign.exe，可以直接调用。
+#
+# 绕行办法：build-tools 把这两个工具的实现也以 jar 形式放在 lib/ 下
+# （lib/d8.jar、lib/apksigner.jar），用 java 直调主类即可，与平台无关：
+#     java -cp <BT>/lib/d8.jar       com.android.tools.r8.D8
+#     java -cp <BT>/lib/apksigner.jar com.android.apksigner.ApkSignerTool
+# 仓库里 build.sh 早就用同样手法直调过 r8.jar 的 D8，这里只是把同一手法收敛成
+# 一处，免得每个脚本各写一遍、各错一遍。
+#
+# 另外：Windows 上 java 的 path.separator 是 ';'，但 Git Bash(MSYS) 会把传进去的
+# ':' 分隔类路径自动转成 ';'，所以调用方继续用 ':' 拼接即可，不要改成分号
+# （分号在 MSYS 下不会被转换，反而会失效）。
+
+# jethub_check_build_tools <build-tools 目录>
+# d8 / apksigner / zipalign 三个组件都可用才返回 0。
+jethub_check_build_tools() {
+  local bt="$1"
+  [ -d "$bt" ] || return 1
+  [ -x "$bt/d8" ] || [ -f "$bt/lib/d8.jar" ] || return 1
+  [ -x "$bt/apksigner" ] || [ -f "$bt/lib/apksigner.jar" ] || return 1
+  [ -x "$bt/zipalign" ] || [ -x "$bt/zipalign.exe" ] || return 1
+  return 0
+}
+
+# jethub_resolve_build_tools
+# 解析 build-tools 目录，按优先级：
+#   1. 调用者显式给的 ANDROID_BUILD_TOOLS
+#   2. 仓库自举的 $SDK/build-tools/$BT_VERSION
+#   3. 系统 Android SDK（ANDROID_SDK_ROOT / ANDROID_HOME）里版本最高的一个
+#
+# 第 3 条在 Windows 上是必须的：fetch-deps.sh 拉的是 Linux 版 build-tools
+# （build-tools_r34-linux.zip，ELF 二进制），Windows 上根本跑不了；而本机通常已经
+# 装好 Windows 版 Android SDK，直接用现成的即可，不必也无法自举。
+# 找不到就输出空串。
+jethub_resolve_build_tools() {
+  local cand bt sys_sdk
+  if [ -n "${ANDROID_BUILD_TOOLS:-}" ]; then
+    printf '%s\n' "$ANDROID_BUILD_TOOLS"
+    return 0
+  fi
+  cand="$SDK/build-tools/$BT_VERSION"
+  if jethub_check_build_tools "$cand"; then
+    printf '%s\n' "$cand"
+    return 0
+  fi
+  for sys_sdk in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" "$HOME/Android/Sdk" "$HOME/Library/Android/sdk"; do
+    [ -n "$sys_sdk" ] && [ -d "$sys_sdk/build-tools" ] || continue
+    for bt in "$sys_sdk"/build-tools/*; do
+      [ -d "$bt" ] || continue
+      jethub_check_build_tools "$bt" || continue
+      printf '%s\n' "$bt"
+    done
+  done | sort -V | tail -1
+}
+
+# jethub_d8 <d8 参数…>
+jethub_d8() {
+  if [ -x "$ANDROID_BUILD_TOOLS/d8" ]; then
+    "$ANDROID_BUILD_TOOLS/d8" "$@"
+  else
+    java $JETHUB_JAVA_OPTS -cp "$ANDROID_BUILD_TOOLS/lib/d8.jar" com.android.tools.r8.D8 "$@"
+  fi
+}
+
+# jethub_apksigner <apksigner 参数…>
+jethub_apksigner() {
+  if [ -x "$ANDROID_BUILD_TOOLS/apksigner" ]; then
+    "$ANDROID_BUILD_TOOLS/apksigner" "$@"
+  else
+    java $JETHUB_JAVA_OPTS -cp "$ANDROID_BUILD_TOOLS/lib/apksigner.jar" \
+      com.android.apksigner.ApkSignerTool "$@"
+  fi
+}
+
+# jethub_zipalign <zipalign 参数…>
+jethub_zipalign() {
+  if [ -x "$ANDROID_BUILD_TOOLS/zipalign" ]; then
+    "$ANDROID_BUILD_TOOLS/zipalign" "$@"
+  elif [ -x "$ANDROID_BUILD_TOOLS/zipalign.exe" ]; then
+    "$ANDROID_BUILD_TOOLS/zipalign.exe" "$@"
+  else
+    echo "找不到 zipalign：$ANDROID_BUILD_TOOLS" >&2
+    return 1
+  fi
+}
+
 # ensure_deps "<jar 名单>" [want_upstream]
 # 缺失就调 fetch-deps.sh 自举；自举后仍缺则报错退出。
 # want_upstream=1 时把「原始墨听 APK」也算进依赖。
@@ -97,10 +197,12 @@ ensure_deps() {
   for f in $want; do
     [ -f "$TOOLCHAIN/$f" ] || need=1
   done
-  # build-tools 只认「调用者显式指定的」或「已自举好的」。
-  # 注意不能在这里把结果定死：fetch-deps.sh 跑完之前 SDK 可能还不存在，
-  # 自举之后必须重新解析一次，否则会拿着空值走到后面报错。
-  if [ -z "${ANDROID_BUILD_TOOLS:-}" ] && [ ! -x "$SDK/build-tools/$BT_VERSION/zipalign" ]; then
+  # build-tools 只认「调用者显式指定的」或「能解析到的」。
+  # 判定必须走 jethub_resolve_build_tools 而不是只看 $SDK/build-tools/$BT_VERSION：
+  # Windows 上系统 SDK 里的 build-tools 是可用的，若这里只认自举目录，就会误判为
+  # 缺依赖而去跑 fetch-deps.sh —— 而它拉的是 build-tools_r34-linux.zip（ELF），
+  # Windows 上下载完照样不能用，白白浪费时间。
+  if [ -z "$(jethub_resolve_build_tools)" ]; then
     need=1
   fi
   if [ -n "$want_upstream" ] && [ -z "$(jethub_upstream_apk)" ]; then
@@ -112,14 +214,17 @@ ensure_deps() {
     bash "$JETHUB_ROOT/scripts/fetch-deps.sh"
   fi
 
-  # 自举之后才解析 build-tools（此时 SDK 一定已就位）
+  # 自举之后才解析 build-tools：可能是自举下来的，也可能直接复用系统 SDK。
   if [ -z "${ANDROID_BUILD_TOOLS:-}" ]; then
-    ANDROID_BUILD_TOOLS="$SDK/build-tools/$BT_VERSION"
+    ANDROID_BUILD_TOOLS="$(jethub_resolve_build_tools)"
   fi
   export ANDROID_BUILD_TOOLS
-  [ -x "$ANDROID_BUILD_TOOLS/zipalign" ] || {
-    echo "build-tools 不可用：$ANDROID_BUILD_TOOLS" >&2
-    echo "  跑 bash scripts/fetch-deps.sh，或用 ANDROID_BUILD_TOOLS 指定已有目录。" >&2
+  jethub_check_build_tools "$ANDROID_BUILD_TOOLS" || {
+    echo "build-tools 不可用：${ANDROID_BUILD_TOOLS:-<未找到>}" >&2
+    echo "  Linux/macOS：跑 bash scripts/fetch-deps.sh 自举。" >&2
+    echo "  Windows：fetch-deps.sh 拉的是 Linux 版 build-tools，用不了；" >&2
+    echo "           请装 Android SDK 的 build-tools，或直接指定目录：" >&2
+    echo "           ANDROID_BUILD_TOOLS=/d/Android/android-sdk/build-tools/35.0.0 bash scripts/build-full.sh" >&2
     exit 1
   }
 

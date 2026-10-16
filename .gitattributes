@@ -1,0 +1,27 @@
+# 所有文本文件统一以 LF 检出。
+#
+# 为什么必须有这个文件：脚本与源码里全是中文，且 scripts/*.sh 用 bash 执行。
+# Windows 上 git 默认 core.autocrlf=true，会把检出文件写成 CRLF —— bash 读到行尾
+# 的 \r 会当成命令的一部分，直接报
+#   $'\r': command not found
+# 脚本一行都跑不动；python 脚本的 shebang 同样失效。这类故障在 Linux 上永远不会
+# 出现，一旦有人用 Windows 克隆就会踩到，所以把行尾策略固化进仓库而不是靠本地
+# git config。
+#
+# 注意：不要把 *.bat 之类需要 CRLF 的文件加进来 —— 本仓库没有这类文件。
+* text=auto eol=lf
+
+# 二进制：禁止任何行尾转换与文本 diff
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.jar   binary
+*.apk   binary
+*.dex   binary
+*.so    binary
+*.jks   binary
+*.keystore binary
+*.p12   binary

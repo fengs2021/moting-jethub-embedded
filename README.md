@@ -32,7 +32,34 @@ JETHUB_KEYSTORE=/path/to/your.jks JETHUB_KS_PASS='***' \
 `JETHUB_KEYSTORE` 也能跑，但产出的是未签名包，只能本地验证、不能安装分发。
 
 前置条件只有三样：**JDK 11+**（`javac`）、**python3**、**curl/unzip**。apktool、d8、
-baksmali、zipalign、apksigner 全部自动备好，不需要预装 Android SDK。
+baksmali、zipalign、apksigner 全部自动备好，不需要预装 Android SDK（**Windows 例外**，
+见下节）。
+
+### Windows 上构建
+
+脚本在 Git Bash（MSYS2）下可直接跑，但有两处与 Linux 不同，都已在脚本内处理：
+
+- **build-tools 必须复用系统 SDK。** `fetch-deps.sh` 拉的是 `build-tools_r34-linux.zip`
+  （ELF 二进制），Windows 上跑不了，所以它会跳过这一步；脚本会自动去
+  `ANDROID_SDK_ROOT` / `ANDROID_HOME` 里找版本最高的 build-tools。也可以显式指定：
+
+  ```bash
+  ANDROID_BUILD_TOOLS=/d/Android/android-sdk/build-tools/35.0.0 bash scripts/build-full.sh
+  ```
+
+- **`d8` 与 `apksigner` 在 Windows 上只有 `.bat`，没有无扩展名的可执行文件**，直接
+  `"$BT/d8"` 会报 `No such file or directory`（退出码 127）。脚本改走 java 直调
+  `lib/d8.jar` 与 `lib/apksigner.jar` 的主类，与平台无关；`zipalign` 有原生 `zipalign.exe`，
+  照常直接调用。这三处统一收敛在 `scripts/lib-deps.sh` 的 `jethub_d8` /
+  `jethub_apksigner` / `jethub_zipalign` 三个函数里。
+
+仓库自带 `.gitattributes`（`* text=auto eol=lf`），保证脚本以 LF 检出。若你的仓库是在
+加这个文件**之前**克隆的，`core.autocrlf=true` 会让工作区的 `.sh` 全是 CRLF，bash 会报
+`$'\r': command not found`。修法是重新检出：
+
+```bash
+git rm --cached -r . && git reset --hard
+```
 
 想用别的墨听版本（比如你手上更新的 4.0.20-r2）就把它指过来，自动下载那步会跳过：
 
@@ -127,8 +154,9 @@ src/test/         host JVM 上的端到端与回归测试（不依赖 Android �
 src/test/e2e/     真实凭据下的端到端验证脚本（RegTest / UiE2E / ModelMgmtTest …）
 smali-glue/       不能写成 Java 的 Compose 胶水（菜单文案 / 点击行为两个 smali 类）
 patches/          对墨听反编译树的补丁脚本（菜单注入、桌面图标移除、模型中心刷新、
-                  预标注区间收敛、改包名）
-tools/            验证工具（verify_clamp.py：自写 Dalvik 解释器 + 参考实现对照）
+                  预标注区间收敛、改包名、改应用显示名）
+tools/            验证工具（verify_clamp.py：自写 Dalvik 解释器 + 参考实现对照；
+                  verify-apk.sh：成品包验收，dex 分包连续性 / 关键类落位 / 入口三要素 / 签名）
 tests/art/        真机 ART 验证（把补丁的 smali 丢给真实 ART 执行，替代人眼审查）
 scripts/          fetch-deps 拉依赖；build-full 全量出包；build 轻量路线；prepare 备输入
 assets/jethub/    管理页前端（单文件 HTML，无外部依赖）
@@ -148,7 +176,7 @@ docs/             里程碑日志 + 单点修复的详细记录（如 OVERLAP-FI
 | `baksmali.jar` / `smali.jar` | [smali v2.5.2 fat jar](https://github.com/baksmali/smali/releases/tag/v2.5.2) | dex ↔ smali |
 | `r8.jar` | [Google Maven 8.2.33](https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.2.33/r8-8.2.33.jar) | d8：class → dex |
 | `json.jar` | [org.json 20240303](https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar) | host 侧单测 |
-| `build-tools/34.0.0` | [build-tools_r34-linux.zip](https://dl.google.com/android/repository/build-tools_r34-linux.zip) | d8 / zipalign / apksigner / aapt2 |
+| `build-tools/34.0.0` | [build-tools_r34-linux.zip](https://dl.google.com/android/repository/build-tools_r34-linux.zip) | d8 / zipalign / apksigner / aapt2（**仅 Linux/macOS**；Windows 见上） |
 | `android-34.jar` | [platform-34-ext7_r03.zip](https://dl.google.com/android/repository/platform-34-ext7_r03.zip) | javac 编译用的平台库 |
 
 GitHub 在国内是**间歇性可达**的：同一个 URL 这次能下、下次超时。所以 `fetch-deps.sh` 对
@@ -217,7 +245,7 @@ bash scripts/build-full.sh
 | 4 | 同步管理页 `assets/jethub/home.html` 进反编译树 |
 | 5 | `d8` 把 `jet/**` 打成 dex，再 `baksmali` 成下一个空闲分包（现有最大编号 +1，见上） |
 | 6 | 打补丁：胶水类 / manifest 注册 / 菜单注入 / Boot 注入 / 模型中心刷新（全部幂等） |
-| 7 | 改包名（可选，设了 `JETHUB_PACKAGE` 才做） |
+| 7 | 改包名（可选，设了 `JETHUB_PACKAGE` 才做）+ 改应用显示名（默认「墨听JetHub」） |
 | 8 | `apktool b` 全量回编 |
 | 9 | `zipalign` + `apksigner` |
 
@@ -241,6 +269,7 @@ bash scripts/build-full.sh
 JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-ui.py       # 胶水 + manifest + 菜单 + Boot
 JETHUB_DECODED=$PWD/full-decoded python3 patches/patch-refresh.py  # 返回模型中心时自动刷新
 python3 patches/patch-overlap.py full-decoded                      # 预标注区间收敛
+python3 patches/patch-label.py full-decoded                        # 应用显示名 墨听 → 墨听JetHub
 ```
 
 三个脚本都接受反编译树路径作为第一个参数，缺省读环境变量 `JETHUB_DECODED`，再缺省
@@ -288,7 +317,36 @@ dex 分包编号随墨听版本变化，不能硬编码。`patch-overlap.py` 另
 ```bash
 python3 tools/verify_clamp.py            # 自写 Dalvik 解释器 + 参考实现对照（10+5+12 项）
 bash tests/art/run-art-test.sh           # 真实 Android ART 执行补丁的 smali（8 个用例）
+bash tools/verify-apk.sh                 # 成品包验收（见下）
 ```
+
+### 成品包验收
+
+出包之后、装机之前，跑一次：
+
+```bash
+bash tools/verify-apk.sh                          # 自动取最新的 墨听-*.apk
+bash tools/verify-apk.sh apk/built-full.apk       # 或指定路径
+```
+
+它检查四类东西，其中第一类是**唯一必须查**的：
+
+1. **dex 分包连续性**。Android 运行时按 `classes.dex`、`classes2.dex`… 顺序扫描，
+   遇到第一个缺失编号就停下，后面的 dex 一律不加载。上游 4.0.20-r2 有 8 个 dex，
+   注入类写进 `classes9`/`classes10` 刚好连续；但若上游只有 7 个 dex，`classes8` 空缺，
+   写进 `classes9` 就会让 `Boot`/`JetHubActivity`/胶水类全部加载不到，启动即
+   `NoClassDefFoundError: Failed resolution of: Ljet/android/Boot;` 闪退 ——
+   而回编、签名、产物结构检查全都正常，**只有装到机器上才炸**。所以 `build-full.sh`
+   取的是「现有最大编号 +1」（`jethub_next_dex_slot`），验收工具再复核一遍。
+2. **关键类落位**（`Boot` / `JetHubActivity` / 两个胶水类 / `JetHubCanonicalClamp`）。
+3. **入口三要素**：Manifest 注册了 `JetHubActivity`、`assets/jethub/home.html` 已打入、
+   `App.onCreate()` 注入了 `Boot.init()`。三者缺一则装出的包没有入口（网关在跑但点不进去）。
+4. **包身份与签名证书**。
+
+> 验收用 `baksmali` 反汇编而不是 `grep` APK：`AndroidManifest.xml` 与 `res/values/strings.xml`
+> 在包里都是**编译后的二进制 XML**，文本 grep 必然找不到，会误报「未注册」「未改名」。
+> 另外 `dexdump` 的方法引用格式是 `Ljet/android/Boot;.init`（点号），不是 smali 的 `->init`，
+> 用错格式也会误报「未注入」。
 
 > 为什么值得单独写个解释器和真机测试：这个补丁的 `if-ge`/`if-gt` 方向在编写过程中被写反过
 > 多次，而 `smali.jar assemble` **只检查语法不检查语义**——每次都「编译通过」。人眼审查在
@@ -315,6 +373,23 @@ smali 中（`BuildConfig.APPLICATION_ID`、三个 provider authorities、取包�
 > 改名后是**另一个应用**：不会继承原版墨听的书架、阅读进度、AI 模型中心配置，
 > 需要重新初始化。这是 applicationId 的固有语义。
 
+### 改应用显示名（可选）
+
+`patch-label.py` 把桌面图标下的名字从「墨听」改成「墨听JetHub」，用来区分原版与内置版：
+
+```bash
+python3 patches/patch-label.py full-decoded                      # 只改默认资源
+python3 patches/patch-label.py full-decoded --all-locales        # 四个 locale 一起改
+python3 patches/patch-label.py full-decoded 墨听JetHub测试版      # 自定义名称
+```
+
+`app_name` 分布在四个文件里：`res/values/strings.xml`（默认）与 `values-zh-rCN` /
+`values-zh-rHK` / `values-zh-rTW`。默认只改前者——中文设备会走 `values-zh-rCN`，
+所以**想在中英文设备上都看到改名，得加 `--all-locales`**。
+
+> 注意别误伤 `app_name_a`（值「阅读db·A」）。脚本的正则锚定 `<string name="app_name">`，
+> 后面紧跟的不是 `>`，所以 `app_name_a` 不会被命中。
+
 ### 环境变量一览
 
 | 变量 | 默认 | 说明 |
@@ -323,12 +398,14 @@ smali 中（`BuildConfig.APPLICATION_ID`、三个 provider authorities、取包�
 | `JETHUB_UPSTREAM_TAG` | `v4.0.19-r1` | 上游 release tag |
 | `JETHUB_UPSTREAM_ASSET` | `MoTing-4.0.19-r1-…-R8-release.apk` | 上游资产名 |
 | `JETHUB_UPSTREAM_SHA` | `1f2b7e9b…4530af` | 上游资产 sha256 |
-| `ANDROID_BUILD_TOOLS` | `./sdk/build-tools/34.0.0` | 含 zipalign/apksigner/d8 |
+| `ANDROID_BUILD_TOOLS` | 先找 `./sdk/build-tools/34.0.0`，再回退系统 SDK 里最高版本 | 含 zipalign/apksigner/d8 |
 | `JETHUB_TOOLCHAIN` | `./toolchain` | jar 目录 |
 | `JETHUB_SDK` | `./sdk` | SDK 片段目录 |
 | `JETHUB_DECODED` | `./full-decoded` | 反编译树 |
 | `JETHUB_KEYSTORE` / `JETHUB_KS_ALIAS` / `JETHUB_KS_PASS` / `JETHUB_KEY_PASS` | — / `jethub` / — / 同前 | 签名 |
 | `JETHUB_PACKAGE` | 空 | 改包名，空则沿用上游 |
+| `JETHUB_APP_LABEL` | `墨听JetHub` | 改应用显示名；传空串则跳过 |
+| `JETHUB_APP_LABEL_ALL_LOCALES` | 空 | 非空则四个 locale 的 `app_name` 一起改 |
 | `JETHUB_OUT` | `墨听-4.0.20-jethub内置版.apk` | 产物名 |
 | `JETHUB_REDECODE` | 空 | 非空则强制重新解包 |
 | `JETHUB_SKIP_DEPS` | 空 | 非空则跳过依赖自举 |

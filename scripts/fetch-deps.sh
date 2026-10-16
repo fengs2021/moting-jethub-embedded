@@ -15,6 +15,14 @@
 #   sdk/build-tools/34.0.0/    d8 / zipalign / apksigner / aapt2
 #   sdk/platforms/android-34/  平台库（android.jar 的原始出处）
 #
+# 平台差异（Windows）：
+#   Google 只为 build-tools 提供整包 zip，而官方仓库里 34.0.0 只有 linux 版
+#   （build-tools_r34-linux.zip，里面是 ELF 二进制）。Windows 上即使下下来也跑不了，
+#   所以本脚本在 Windows 上**跳过 build-tools 这一节**，改为要求复用本机已装的
+#   Android SDK —— 由 lib-deps.sh 的 jethub_resolve_build_tools 从
+#   ANDROID_SDK_ROOT / ANDROID_HOME 里挑版本最高的一个。
+#   其余四步（工具链 jar、android-34.jar、上游 APK）与平台无关，照常执行。
+#
 # GitHub 在国内是间歇性可达的（同一个 URL 这次通、下次超时），所以 GitHub 的
 # 资源按「直连 → 一组加速镜像」的顺序依次尝试，谁先成功用谁。所有来源都过
 # sha256 校验，镜像即使被投毒也进不来。
@@ -54,6 +62,15 @@ SRC_BUDGET="${JETHUB_SRC_BUDGET:-300}"
 # 假设所有源都只有 40 KB/s，68 MB 的上游包需要 4~5 轮才够。
 MAX_PASSES="${JETHUB_MAX_PASSES:-10}"
 BT_DIR="$SDK/build-tools/34.0.0"
+
+# 判定当前是不是 Windows（Git Bash / MSYS / Cygwin）。
+# uname 在 Git Bash 下是 MINGW64_NT-10.0-…，在 Cygwin 下是 CYGWIN_NT-…。
+jethub_is_windows() {
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 command -v curl >/dev/null || { echo "需要 curl" >&2; exit 1; }
 command -v sha256sum >/dev/null || { echo "需要 sha256sum" >&2; exit 1; }
@@ -198,21 +215,34 @@ MANIFEST
 
 echo
 echo "== 2/4 Android build-tools 34.0.0 → $BT_DIR =="
-BT_ZIP_URL="https://dl.google.com/android/repository/build-tools_r34-linux.zip"
-BT_ZIP_SHA="e858c4b60069d0431051b225d384413b1643e1289b00a4825aed347f25bd510f"
-if [ -x "$BT_DIR/zipalign" ] && [ -x "$BT_DIR/apksigner" ] && [ -x "$BT_DIR/d8" ]; then
-  echo "  ✓ build-tools 已就绪"
+if jethub_is_windows; then
+  # Windows 上没有可用的官方 build-tools 整包（Google 只提供 linux/mac 版），
+  # 硬下下来是 ELF，跑不了。这里明确跳过，并把「必须复用系统 SDK」讲清楚，
+  # 免得用户以为依赖装好了、到构建末尾才发现 d8 不存在。
+  echo "  - 当前是 Windows（$(uname -s)），跳过 build-tools 下载。"
+  echo "    Google 只提供 build-tools 的 linux/macOS 整包，Windows 上无法使用。"
+  if [ -d "${ANDROID_SDK_ROOT:-}/build-tools" ] || [ -d "${ANDROID_HOME:-}/build-tools" ]; then
+    echo "    已检测到系统 Android SDK，构建脚本会自动选用其 build-tools。"
+  else
+    echo "    ✗ 未检测到系统 Android SDK。请先安装，或设 ANDROID_SDK_ROOT/ANDROID_HOME。"
+  fi
 else
-  fetch "$BT_ZIP_URL" "$SDK/build-tools.zip" "$BT_ZIP_SHA"
-  rm -rf "$SDK/.bt.tmp" && mkdir -p "$SDK/.bt.tmp"
-  unzip -q "$SDK/build-tools.zip" -d "$SDK/.bt.tmp"
-  # zip 里的顶层目录名是 AOSP 内部代号（android-14），统一改成版本号
-  src="$(dirname "$(find "$SDK/.bt.tmp" -maxdepth 2 -name zipalign -type f | head -1)")"
-  [ -n "$src" ] && [ -d "$src" ] || { echo "  ✗ build-tools zip 结构异常" >&2; exit 1; }
-  rm -rf "$BT_DIR" && mv "$src" "$BT_DIR"
-  rm -rf "$SDK/.bt.tmp"
-  chmod +x "$BT_DIR"/d8 "$BT_DIR"/zipalign "$BT_DIR"/apksigner "$BT_DIR"/aapt2 2>/dev/null || true
-  echo "  ✓ build-tools 就绪：$(ls "$BT_DIR" | tr '\n' ' ')"
+  BT_ZIP_URL="https://dl.google.com/android/repository/build-tools_r34-linux.zip"
+  BT_ZIP_SHA="e858c4b60069d0431051b225d384413b1643e1289b00a4825aed347f25bd510f"
+  if [ -x "$BT_DIR/zipalign" ] && [ -x "$BT_DIR/apksigner" ] && [ -x "$BT_DIR/d8" ]; then
+    echo "  ✓ build-tools 已就绪"
+  else
+    fetch "$BT_ZIP_URL" "$SDK/build-tools.zip" "$BT_ZIP_SHA"
+    rm -rf "$SDK/.bt.tmp" && mkdir -p "$SDK/.bt.tmp"
+    unzip -q "$SDK/build-tools.zip" -d "$SDK/.bt.tmp"
+    # zip 里的顶层目录名是 AOSP 内部代号（android-14），统一改成版本号
+    src="$(dirname "$(find "$SDK/.bt.tmp" -maxdepth 2 -name zipalign -type f | head -1)")"
+    [ -n "$src" ] && [ -d "$src" ] || { echo "  ✗ build-tools zip 结构异常" >&2; exit 1; }
+    rm -rf "$BT_DIR" && mv "$src" "$BT_DIR"
+    rm -rf "$SDK/.bt.tmp"
+    chmod +x "$BT_DIR"/d8 "$BT_DIR"/zipalign "$BT_DIR"/apksigner "$BT_DIR"/aapt2 2>/dev/null || true
+    echo "  ✓ build-tools 就绪：$(ls "$BT_DIR" | tr '\n' ' ')"
+  fi
 fi
 
 echo
@@ -275,6 +305,10 @@ export JETHUB_UPSTREAM_APK="$UPSTREAM_APK"
 
 echo
 echo "依赖就绪。"
-echo "  ANDROID_BUILD_TOOLS=$BT_DIR"
+if jethub_is_windows; then
+  echo "  ANDROID_BUILD_TOOLS=（由 lib-deps.sh 自动解析系统 SDK 的 build-tools）"
+else
+  echo "  ANDROID_BUILD_TOOLS=$BT_DIR"
+fi
 echo "  JETHUB_TOOLCHAIN=$TOOLCHAIN"
 echo "  JETHUB_UPSTREAM_APK=$UPSTREAM_APK"

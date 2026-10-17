@@ -105,7 +105,278 @@ public class RegTest {
         // ── OpenCode 适配器（回归：形状门禁与错误分类都极易写错） ──
         opencodeCases();
 
+        // ── CodeArts 适配器（回归：签名 / 错误分类 / 模型归一化都极易写错） ──
+        codeartsCases();
+
         System.out.println("REG PASS");
+    }
+
+    /**
+     * CodeArts（华为云）适配器回归。
+     *
+     * <p>这里锁的都是「写错后症状极隐蔽」的点：签名 canonical 的字段顺序、
+     * {@code 429} 的锚定匹配、日期后缀归一化、benefit 记录的「未改写才记」规则。
+     */
+    private static void codeartsCases() throws Exception {
+        // ① 模型 id 归一化：末尾 -NNNN 日期后缀必须剥离（chat 端点只认无后缀 id）
+        if (!"deepseek-v4-flash".equals(CodeartsProvider.normalizeModelId("deepseek-v4-flash-0731"))) {
+            throw new AssertionError("日期后缀未剥离: " + CodeartsProvider.normalizeModelId("deepseek-v4-flash-0731"));
+        }
+        if (!"deepseek-v4.1-flash".equals(CodeartsProvider.normalizeModelId("deepseek-v4.1-flash"))) {
+            throw new AssertionError("无后缀 id 不应被改写");
+        }
+        if (!"glm-5.3-flash".equals(CodeartsProvider.normalizeModelId("glm-5.3-flash"))) {
+            throw new AssertionError("glm-5.3-flash 不应被改写");
+        }
+        // 只有 4 位数字才算日期后缀：5 位、非数字都不能剥
+        if (!"model-12345".equals(CodeartsProvider.normalizeModelId("model-12345"))) {
+            throw new AssertionError("5 位数字不应被当日期后缀");
+        }
+        if (!"model-abc".equals(CodeartsProvider.normalizeModelId("model-abc"))) {
+            throw new AssertionError("非数字后缀不应被剥离");
+        }
+        System.out.println("CodeArts-模型归一化: -NNNN 后缀剥离正确（含边界）");
+
+        // ② 视觉模型过滤：-VL- 中缀与 -VL 后缀
+        if (!CodeartsProvider.isVisionModel("Qwen2.5-VL-72B")) throw new AssertionError("-VL- 应判为视觉模型");
+        if (!CodeartsProvider.isVisionModel("glm-4v-VL")) throw new AssertionError("-VL 后缀应判为视觉模型");
+        if (CodeartsProvider.isVisionModel("deepseek-v4-flash")) throw new AssertionError("普通模型不应判为视觉");
+        System.out.println("CodeArts-视觉过滤: -VL-/-VL 正确识别");
+
+        // ③ 排队码：429 必须锚定为独立数字。
+        //    ⚠️ 额度码 InferHub.4291.200 里的 4291 曾被子串 429 命中，
+        //    导致误判为排队 → 静默重试 30 分钟、界面零输出（真实报障）。
+        if (!CodeartsProvider.isQueueErrorCode("InferHub.ModelArts.81111.429")) {
+            throw new AssertionError("81111.429 应判为排队");
+        }
+        if (!CodeartsProvider.isQueueErrorCode("TM.00001041")) throw new AssertionError("TM.00001041 应判为排队");
+        if (CodeartsProvider.isQueueErrorCode("InferHub.4291.200")) {
+            throw new AssertionError("额度码 4291 绝不能被 429 子串命中成排队");
+        }
+        if (!CodeartsProvider.isQueueErrorCode("rate limit exceeded")) {
+            throw new AssertionError("rate limit 应判为排队");
+        }
+        if (!CodeartsProvider.isQueueErrorCode("当前排队中，请稍候")) throw new AssertionError("中文「排队」应判为排队");
+        // 独立数字 429 本身仍要命中
+        if (!CodeartsProvider.isQueueErrorCode("HTTP 429 Too Many Requests")) {
+            throw new AssertionError("独立 429 应判为排队");
+        }
+        System.out.println("CodeArts-排队码: 429 锚定为独立数字（4291 不误判）");
+
+        // ④ 额度耗尽：不可重试，且必须与排队分支分开
+        if (!CodeartsProvider.isQuotaExhaustedCode("InferHub.4291.200", "insufficient quota")) {
+            throw new AssertionError("4291 应判为额度耗尽");
+        }
+        if (!CodeartsProvider.isQuotaExhaustedCode("InferHub.4291.999", "")) {
+            throw new AssertionError("4291 其它尾号应同样判为额度耗尽（上游可能改尾号）");
+        }
+        if (!CodeartsProvider.isQuotaExhaustedCode("", "Insufficient_Quota")) {
+            throw new AssertionError("文案兜底 insufficient quota 不可省");
+        }
+        if (CodeartsProvider.isQuotaExhaustedCode("TM.00001041", "peak usage")) {
+            throw new AssertionError("排队码不应被判成额度耗尽");
+        }
+        System.out.println("CodeArts-额度: 4291/文案兜底命中，且不与排队混淆");
+
+        // ⑤ 错误分类：额度语义必须先于 auth（额度错误常带 401/403/429）
+        checkCodeartsKind(200, "{\"error_code\":\"InferHub.4291.200\",\"error_msg\":\"insufficient quota\"}",
+                CodeartsProvider.KIND_QUOTA);
+        checkCodeartsKind(200, "{\"error_code\":\"InferHub.ModelArts.81111.429\"}", CodeartsProvider.KIND_QUEUE);
+        checkCodeartsKind(200, "{\"error_code\":\"TM.00001041\",\"error_msg\":\"并发会话数已达上限\"}",
+                CodeartsProvider.KIND_QUEUE);
+        checkCodeartsKind(401, "{\"error_code\":\"APIG.0602\",\"error_msg\":\"Invalid token\"}",
+                CodeartsProvider.KIND_AUTH);
+        checkCodeartsKind(500, "{\"error_msg\":\"boom\"}", CodeartsProvider.KIND_SERVER);
+        checkCodeartsKind(0, "", CodeartsProvider.KIND_TRANSPORT);
+        System.out.println("CodeArts-错误分类: 额度/排队/auth/server/transport 顺序正确");
+
+        // ⑥ 鉴权文本判据
+        if (!CodeartsProvider.isAuthErrorText("{\"error_code\":\"APIG.0602\"}")) {
+            throw new AssertionError("APIG.0602 应判为鉴权失败");
+        }
+        if (!CodeartsProvider.isAuthErrorText("token expired")) throw new AssertionError("token expired 应判鉴权");
+        if (CodeartsProvider.isAuthErrorText("insufficient quota")) {
+            throw new AssertionError("额度文案不应判为鉴权失败");
+        }
+        if (!CodeartsProvider.isAuthError(401) || !CodeartsProvider.isAuthError(403)) {
+            throw new AssertionError("401/403 应判为鉴权失败");
+        }
+        System.out.println("CodeArts-鉴权: 401/403 与文本判据正确");
+
+        // ⑦ benefit not found：去掉 maas_type 头重试一次即可
+        if (!CodeartsProvider.isBenefitNotFound("data:{\"error_code\":\"InferHub.4004.200\"}")) {
+            throw new AssertionError("InferHub.4004.200 应识别为 benefit 缺失");
+        }
+        if (CodeartsProvider.isBenefitNotFound("InferHub.4291.200")) {
+            throw new AssertionError("额度码不应识别为 benefit 缺失");
+        }
+        System.out.println("CodeArts-benefit: InferHub.4004.200 正确识别");
+
+        // ⑧ SSE 内嵌错误：HTTP 200 + error_code 是 CodeArts 的常见形态，
+        //    只看状态码会让界面停在「运行中」零输出
+        if (!"InferHub.4291.200".equals(CodeartsProvider.sseErrorCode(
+                "{\"error_code\":\"InferHub.4291.200\",\"error_msg\":\"insufficient quota\"}"))) {
+            throw new AssertionError("SSE error_code 未抽出");
+        }
+        if (CodeartsProvider.sseErrorCode("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}") != null) {
+            throw new AssertionError("正常分片不应抽出 error_code");
+        }
+        String sseText = CodeartsProvider.sseErrorText(
+                "{\"error_code\":\"InferHub.4291.200\",\"error_msg\":\"insufficient quota\"}");
+        if (!sseText.contains("4291") || !sseText.contains("insufficient quota")) {
+            throw new AssertionError("SSE 错误文本应含码与文案: " + sseText);
+        }
+        // OpenAI 风格 error 对象也要能抽
+        if (!"invalid_request".equals(CodeartsProvider.sseErrorCode(
+                "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad\"}}"))) {
+            throw new AssertionError("OpenAI 风格 error.code 未抽出");
+        }
+        System.out.println("CodeArts-SSE 错误: error_code/error 两种形态均可抽出");
+
+        // ⑨ body：stream 恒 true、prompt_cache_key=sessionId、tool_stream、
+        //    max_tokens 默认 65536（131072 实测触发空流）、thinking 顶层且只在关思考时补
+        JSONObject req = new JSONObject("{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+        JSONObject body = CodeartsProvider.buildPayload(req, "deepseek-v4-flash", "sess-1");
+        if (!body.optBoolean("stream", false)) throw new AssertionError("stream 必须恒为 true");
+        if (!"sess-1".equals(body.optString("prompt_cache_key"))) {
+            throw new AssertionError("prompt_cache_key 应等于 sessionId");
+        }
+        if (!body.optBoolean("tool_stream", false)) throw new AssertionError("tool_stream 应为 true");
+        if (body.optInt("max_tokens", 0) != 65536) throw new AssertionError("max_tokens 默认应为 65536");
+        if (!body.has("include")) throw new AssertionError("应带 include reasoning.encrypted_content");
+        if (!"auto".equals(body.optString("reasoning_summary"))) throw new AssertionError("reasoning_summary 应为 auto");
+        if (body.has("thinking")) throw new AssertionError("未显式关思考时不应发 thinking");
+
+        // 显式关思考：顶层 thinking:{type:disabled}，且 reasoning_effort 要删掉
+        JSONObject off = CodeartsProvider.buildPayload(
+                new JSONObject("{\"messages\":[],\"reasoning_effort\":\"none\"}"), "m", "s");
+        JSONObject th = off.optJSONObject("thinking");
+        if (th == null || !"disabled".equals(th.optString("type"))) {
+            throw new AssertionError("关思考时应发顶层 thinking:{type:'disabled'}");
+        }
+        if (off.has("reasoning_effort")) throw new AssertionError("reasoning_effort 应被移除（后端不认）");
+
+        // 调用方自带 max_tokens 时不得覆盖
+        JSONObject custom = CodeartsProvider.buildPayload(
+                new JSONObject("{\"messages\":[],\"max_tokens\":4096}"), "m", "s");
+        if (custom.optInt("max_tokens", 0) != 4096) throw new AssertionError("不应覆盖调用方的 max_tokens");
+        System.out.println("CodeArts-body: stream/cache/工具流/max_tokens/thinking 全部正确");
+
+        // ⑩ session id 稳定推导：同一会话的「首条 user 消息」恒定 ⇒ 缓存命中
+        String s1 = CodeartsProvider.sessionIdFor(
+                new JSONObject("{\"messages\":[{\"role\":\"system\",\"content\":\"sys\"},"
+                        + "{\"role\":\"user\",\"content\":\"你好\"},{\"role\":\"assistant\",\"content\":\"a\"}]}"));
+        String s2 = CodeartsProvider.sessionIdFor(
+                new JSONObject("{\"messages\":[{\"role\":\"system\",\"content\":\"sys\"},"
+                        + "{\"role\":\"user\",\"content\":\"你好\"},{\"role\":\"assistant\",\"content\":\"a\"},"
+                        + "{\"role\":\"user\",\"content\":\"再来\"}]}"));
+        if (s1 == null || s1.isEmpty()) throw new AssertionError("session id 不应为空");
+        if (!s1.equals(s2)) {
+            throw new AssertionError("同一会话（多轮追加）应推出同一个 session id: " + s1 + " vs " + s2);
+        }
+        String s3 = CodeartsProvider.sessionIdFor(
+                new JSONObject("{\"messages\":[{\"role\":\"user\",\"content\":\"另一个会话\"}]}"));
+        if (s1.equals(s3)) throw new AssertionError("不同会话不应推出同一个 session id");
+        System.out.println("CodeArts-会话 id: 同会话稳定、跨会话变化");
+
+        // ⑪ 额度文案：给出按 UTC+8 自然日结算的重置时间，且不写成「网关 bug」
+        long now = System.currentTimeMillis();
+        String msg = CodeartsProvider.quotaExhaustedMessage("deepseek-v4-flash", now);
+        if (!msg.contains("deepseek-v4-flash")) throw new AssertionError("额度文案应含模型名: " + msg);
+        if (!msg.contains("额度")) throw new AssertionError("额度文案应说明是额度问题: " + msg);
+        if (!msg.contains("重置")) throw new AssertionError("额度文案应给出重置时间: " + msg);
+        long reset = CodeartsProvider.nextUtc8DayStartMs(now);
+        if (reset <= now) throw new AssertionError("重置时刻必须在未来");
+        if (reset - now > 25 * 3600_000L) throw new AssertionError("重置时刻不应超过 25 小时（UTC+8 当日 24:00）");
+        System.out.println("CodeArts-额度文案: 含模型名与重置时间（" + msg.replace("\n", " ") + "）");
+
+        // ⑫ 非流式聚合：CodeArts 是标准 OpenAI SSE，可直接聚合
+        String caSse = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你\"}}]}\n\n"
+                + "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\"}}]}\n\n"
+                + "data: [DONE]\n\n";
+        JSONObject agg = CodeartsProvider.aggregateSse("deepseek-v4-flash", caSse);
+        String content = agg.getJSONArray("choices").getJSONObject(0)
+                .getJSONObject("message").optString("content", "");
+        if (!"你好".equals(content)) throw new AssertionError("SSE 聚合内容错: " + content);
+        System.out.println("CodeArts-SSE 聚合: content=" + content);
+
+        // ⑬ 聚合遇 SSE 内嵌额度错误必须抛「不可重试」异常，而不是返回半截正文
+        boolean threw = false;
+        try {
+            CodeartsProvider.aggregateSse("m",
+                    "data: {\"error_code\":\"InferHub.4291.200\",\"error_msg\":\"insufficient quota\"}\n\n");
+        } catch (CodeartsProvider.QuotaExhaustedException e) {
+            threw = true;
+        }
+        if (!threw) throw new AssertionError("SSE 内嵌额度错误应抛 QuotaExhaustedException");
+        System.out.println("CodeArts-SSE 聚合: 内嵌额度错误正确抛不可重试异常");
+
+        // ⑭ 签名 canonical：字段顺序与 signedHeaders 排序是协议硬要求，
+        //    写错只会在真实请求上表现为 APIG.0301 verify ak sk signature fail
+        java.util.Map<String, String> h = CodeartsProvider.signRequestHuawei(
+                "AKTEST", "SKTEST", "STTEST", "GET",
+                "https://snap-access.cn-north-4.myhuaweicloud.com/v1/model/builtin", new byte[0], null);
+        String auth = h.get("Authorization");
+        if (auth == null || !auth.startsWith("SDK-HMAC-SHA256 Access=AKTEST,")) {
+            throw new AssertionError("Authorization 头形态错: " + auth);
+        }
+        if (!auth.contains("SignedHeaders=") || !auth.contains("Signature=")) {
+            throw new AssertionError("Authorization 缺少 SignedHeaders/Signature: " + auth);
+        }
+        if (!h.containsKey("x-sdk-date") || !h.containsKey("x-sdk-content-sha256")) {
+            throw new AssertionError("缺少 x-sdk-date / x-sdk-content-sha256 头");
+        }
+        if (!h.containsKey("host")) throw new AssertionError("签名结果应含 host（发送时跳过）");
+        // 签名头名单必须排序且包含 host / x-sdk-date / x-security-token
+        String sh = auth.substring(auth.indexOf("SignedHeaders=") + "SignedHeaders=".length(),
+                auth.indexOf(",Signature="));
+        String[] names = sh.split(";");
+        for (int i = 1; i < names.length; i++) {
+            if (names[i - 1].compareTo(names[i]) > 0) {
+                throw new AssertionError("SignedHeaders 未排序: " + sh);
+            }
+        }
+        if (!sh.contains("host") || !sh.contains("x-sdk-date") || !sh.contains("x-security-token")) {
+            throw new AssertionError("SignedHeaders 缺少必需头: " + sh);
+        }
+        // GET 不带 content-type（协议规定只在非 GET 时加）
+        if (sh.contains("content-type")) throw new AssertionError("GET 不应签 content-type");
+        java.util.Map<String, String> h2 = CodeartsProvider.signRequestHuawei(
+                "AKTEST", "SKTEST", "STTEST", "POST",
+                "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions",
+                "{}".getBytes(java.nio.charset.StandardCharsets.UTF_8), null);
+        String sh2 = h2.get("Authorization");
+        sh2 = sh2.substring(sh2.indexOf("SignedHeaders=") + "SignedHeaders=".length(), sh2.indexOf(",Signature="));
+        if (!sh2.contains("content-type")) throw new AssertionError("POST 必须签 content-type");
+        // 同一输入必须得到同一签名（否则说明有时间/随机成分混进 canonical）
+        java.util.Map<String, String> h3 = CodeartsProvider.signRequestHuawei(
+                "AKTEST", "SKTEST", "STTEST", "GET",
+                "https://snap-access.cn-north-4.myhuaweicloud.com/v1/model/builtin", new byte[0], null);
+        // x-sdk-date 会变，故比较签名头名单与 payload 摘要
+        if (!h.get("x-sdk-content-sha256").equals(h3.get("x-sdk-content-sha256"))) {
+            throw new AssertionError("空 body 的 payload 摘要应稳定");
+        }
+        System.out.println("CodeArts-签名: canonical 排序/必需头/GET-POST 差异正确");
+
+        // ⑮ benefit 判定：兜底集合必须包含实测的两个（它们决定是否带 maas_type 头）
+        if (!CodeartsProvider.isBenefitModel("glm-5.3-flash")) {
+            throw new AssertionError("glm-5.3-flash 应为 benefit 模型");
+        }
+        if (!CodeartsProvider.isBenefitModel("deepseek-v4.1-flash")) {
+            throw new AssertionError("deepseek-v4.1-flash 应为 benefit 模型");
+        }
+        if (CodeartsProvider.isBenefitModel("deepseek-v4-pro")) {
+            throw new AssertionError("deepseek-v4-pro 不应判为 benefit");
+        }
+        System.out.println("CodeArts-benefit 判定: 兜底集合正确");
+    }
+
+    private static void checkCodeartsKind(int status, String body, String expected) {
+        CodeartsProvider.ErrorInfo info = CodeartsProvider.classifyError(status, body, null);
+        if (!expected.equals(info.kind)) {
+            throw new AssertionError("错误分类错: status=" + status + " body=" + body
+                    + " 期望 " + expected + " 实际 " + info.kind);
+        }
     }
 
     private static void opencodeCases() throws Exception {

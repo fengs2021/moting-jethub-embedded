@@ -58,6 +58,7 @@ public final class GatewayServer {
     private volatile BuddyProvider workbuddy;
     private volatile MinimaxProvider minimax;
     private volatile OpencodeProvider opencode;
+    private volatile CodeartsProvider codearts;
     private final CredentialStore store;
     /** 多账号管理（账号总览 / 签到 / 切号）；旧构造器下也会建一个仅用于端点。 */
     private final AccountManager accounts;
@@ -72,6 +73,8 @@ public final class GatewayServer {
     private volatile MinimaxProvider.DeviceAuthorization mmLoginSession;
     private volatile BuddyProvider.LoginSession buddyLoginSession;
     private volatile BuddyProvider.LoginSession workbuddyLoginSession;
+    /** CodeArts 登录会话（回调由 Provider 自建的本地服务器接收，这里只保存状态供 UI 查询）。 */
+    private volatile CodeartsProvider.LoginSession codeartsLoginSession;
 
     private static volatile GatewayServer INSTANCE;
 
@@ -97,6 +100,7 @@ public final class GatewayServer {
         this.workbuddy = accounts.workbuddy(null);
         this.minimax = accounts.minimax(null);
         this.opencode = accounts.opencode(null);
+        this.codearts = accounts.codearts(null);
     }
 
     /** 兼容旧调用（测试用）：Provider 由外部给定，管理端点仍可用。 */
@@ -422,6 +426,57 @@ public final class GatewayServer {
                 } catch (Exception e) {
                     sendJson(out, 502, new JSONObject().put("error", String.valueOf(e.getMessage())).toString());
                 }
+            } else if ("/jethub/codearts/login/start".equals(path) && "POST".equals(method)) {
+                // CodeArts 走 IAM OAuth（PKCE + DPoP），由 Provider 自己起本地回调
+                // 服务器；这里只把 auth_url 交给前端去开浏览器。
+                CodeartsProvider.LoginSession s = codearts.startLogin();
+                codeartsLoginSession = s;
+                sendJson(out, 200, new JSONObject()
+                        .put("auth_url", s.loginUrl)
+                        .put("expires_in", Math.max(0, (s.expiresAtMs - System.currentTimeMillis()) / 1000))
+                        .toString());
+            } else if ("/jethub/codearts/login/poll".equals(path) && "POST".equals(method)) {
+                CodeartsProvider.LoginSession s = codeartsLoginSession;
+                if (s == null) {
+                    sendJson(out, 400, errorJson("没有进行中的 CodeArts 登录"));
+                    return;
+                }
+                if ("done".equals(s.status)) {
+                    // 凭据已在 Provider 内写完账号桶，这里只回报状态；
+                    // 清空会话避免重复轮询时重复 upsert。
+                    codeartsLoginSession = null;
+                    accounts.invalidate(AccountManager.P_CODEARTS);
+                    sendJson(out, 200, new JSONObject().put("status", "done").toString());
+                    return;
+                }
+                if ("error".equals(s.status)) {
+                    String msg = s.message;
+                    codeartsLoginSession = null;
+                    sendJson(out, 200, new JSONObject().put("status", "error")
+                            .put("message", msg == null ? "" : msg).toString());
+                    return;
+                }
+                if (System.currentTimeMillis() > s.expiresAtMs) {
+                    codeartsLoginSession = null;
+                    CodeartsProvider.closeLogin(s);
+                    sendJson(out, 200, new JSONObject().put("status", "expired").toString());
+                    return;
+                }
+                sendJson(out, 200, new JSONObject().put("status", "pending").toString());
+            } else if ("/jethub/codearts".equals(path)) {
+                CodeartsProvider.Credential cc = codearts.loadCredential();
+                JSONObject jo = new JSONObject()
+                        .put("configured", cc != null)
+                        .put("expired", cc != null && codearts.isExpired(cc))
+                        .put("refreshable", cc != null && cc.isRefreshable());
+                if (cc != null) {
+                    JSONObject b = new JSONObject();
+                    b.put("user_name", cc.userName == null ? "" : cc.userName);
+                    b.put("nickname", cc.nickname == null ? "" : cc.nickname);
+                    b.put("expires_at", cc.expiresAt == null ? "" : cc.expiresAt);
+                    jo.put("credential", b);
+                }
+                sendJson(out, 200, jo.toString());
             } else if ("/jethub/models".equals(path)) {
                 sendJson(out, 200, modelsJson(query).toString());
             } else if ("/jethub/opencode/key".equals(path) && "POST".equals(method)) {
@@ -801,6 +856,23 @@ public final class GatewayServer {
                 // 未配置或上游不可用：跳过（Provider 内部已回落兜底表，走到这里说明连兜底都失败）
             }
         }
+        // CodeArts 模型。⚠️ 它的 listModels 会先判凭据是否存在/可续期，再合并
+        // 两个远端目录（benefit 用 opengw gateway/config，常规用 snap /v1/model/builtin）。
+        // 未登录或 SecurityToken 无法续期时抛异常，这里跳过即可 —— 账号没配好
+        // 不该让整个模型目录为空。
+        // provider 为 null 只发生在不传 AccountManager 的旧测试构造器下。
+        if (codearts != null) {
+            try {
+                JSONObject ca = codearts.listModels();
+                JSONArray cd = ca.optJSONArray("data");
+                if (cd != null) for (int i = 0; i < cd.length(); i++) {
+                    JSONObject m = cd.optJSONObject(i);
+                    if (m != null) outData.put(m);
+                }
+            } catch (Exception e) {
+                // 未登录/凭据已失效：跳过
+            }
+        }
         // Cline 模型，同样失败跳过（任何一段都不阻塞整体目录）
         try {
             ClineProvider.Credential c = cline.ensureFresh();
@@ -901,6 +973,10 @@ public final class GatewayServer {
         }
         if (model.startsWith("opencode/")) {
             handleOpencodeChat(req, model.substring("opencode/".length()), out);
+            return;
+        }
+        if (model.startsWith("codearts/")) {
+            handleCodeartsChat(req, model.substring("codearts/".length()), out);
             return;
         }
         // 剥掉 cline/ 前缀
@@ -1141,6 +1217,198 @@ public final class GatewayServer {
             return "无法连接 OpenCode" + detail + " —— 请检查网络或代理。";
         }
         return "OpenCode 服务异常" + detail;
+    }
+
+    /**
+     * CodeArts（华为云）对话转发。
+     *
+     * <p>与其余六家最不同的三处，都必须在这里照顾到：
+     * <ol>
+     *   <li><b>请求要现签</b>：华为云 SDK-HMAC-SHA256 用 AK/SK/SecurityToken 逐请求
+     *       签，SecurityToken 只有几小时有效期，靠 DPoP 刷新续期 —— 签名与续期都在
+     *       {@link CodeartsProvider} 内，这里只负责转发与错误文案。</li>
+     *   <li><b>错误可能是 HTTP 200</b>：排队/限流/额度耗尽常常以 200 + SSE
+     *       {@code error_code} 下发。只看状态码会把错误当正常流，界面永远停在
+     *       「运行中」且零输出 —— 这正是上游报障「CodeArts Agent 没反应」的根因。</li>
+     *   <li><b>benefit 头要能回退</b>：benefit 模型必须带参与签名的 {@code maas_type}
+     *       头；账号里没有 benefit 包时后端以 200 + {@code InferHub.4004.200} 拒绝，
+     *       去掉该头重试一次即可走普通通道（只试一次，避免死循环）。</li>
+     * </ol>
+     */
+    private void handleCodeartsChat(JSONObject req, String model, OutputStream out) throws Exception {
+        boolean stream = req.optBoolean("stream", false);
+        try {
+            codearts.ensureFresh();
+        } catch (Exception e) {
+            sendJson(out, 400, errorJson("未配置 CodeArts 账号，或凭据已过期且无法续期："
+                    + CodeartsProvider.shortErr(e) + " —— 请到管理页重新登录。"));
+            return;
+        }
+        // 会话 id 在整个会话里必须稳定：它既是后端前缀缓存的键，也是并发
+        // 会话的计数单位（并发上限报错 TM.00001041 按会话计）。
+        String sessionId = CodeartsProvider.sessionIdFor(req);
+        boolean wantedBenefit = CodeartsProvider.isBenefitModel(model);
+
+        for (int attempt = 0; attempt < 2; attempt++) {
+            boolean useBenefit = wantedBenefit && attempt == 0;
+            HttpFetcher.Response resp = codearts.chatRaw(req, model, sessionId, useBenefit);
+            if (resp.status != 200) {
+                String err = resp.readText();
+                resp.close();
+                CodeartsProvider.ErrorInfo info = CodeartsProvider.classifyError(resp.status, err, null);
+                sendJson(out, resp.status >= 400 ? resp.status : 502,
+                        errorJson(codeartsErrorMessage(info, model)));
+                return;
+            }
+            if (!stream) {
+                String text = resp.readText();
+                resp.close();
+                if (attempt == 0 && CodeartsProvider.isBenefitNotFound(text)) {
+                    continue;   // 账号无 benefit 包：去掉 maas_type 头再试一次
+                }
+                try {
+                    sendJson(out, 200, CodeartsProvider.aggregateSse(model, text).toString());
+                } catch (CodeartsProvider.QuotaExhaustedException e) {
+                    sendJson(out, 429, errorJson(e.getMessage()));
+                } catch (CodeartsProvider.StreamError e) {
+                    sendJson(out, 502, errorJson(codeartsStreamMessage(e.code, e.getMessage(), model)));
+                }
+                return;
+            }
+            // 流式：先窥探到第一帧再决定是「200 流」还是「错误」——
+            // 一旦写出 200 响应头就不能再改成错误状态码了。
+            java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(resp.body, StandardCharsets.UTF_8));
+            java.util.List<String> buffered = new java.util.ArrayList<>();
+            String firstPayload = null;
+            String line;
+            while ((line = reader.readLine()) != null) {
+                buffered.add(line);
+                String t = line.trim();
+                if (!t.startsWith("data:")) continue;
+                String payload = t.substring(5).trim();
+                if (payload.isEmpty() || "[DONE]".equals(payload)) continue;
+                firstPayload = payload;
+                break;
+            }
+            if (firstPayload == null) {
+                resp.close();
+                sendJson(out, 502, errorJson("CodeArts 上游未返回任何数据 —— 请稍后重试，"
+                        + "或检查该模型当前是否可用。"));
+                return;
+            }
+            String errCode = CodeartsProvider.sseErrorCode(firstPayload);
+            if (errCode != null) {
+                String errText = CodeartsProvider.sseErrorText(firstPayload);
+                resp.close();
+                if (attempt == 0 && CodeartsProvider.isBenefitNotFound(errText)) {
+                    continue;   // 账号无 benefit 包：去掉 maas_type 头再试一次
+                }
+                if (CodeartsProvider.isQuotaExhaustedCode(errText, firstPayload)) {
+                    // 额度按自然日结算：重试结果相同，必须如实报出解禁时间，
+                    // 否则用户会一直等一个不会来的结果。
+                    sendJson(out, 429, errorJson(
+                            CodeartsProvider.quotaExhaustedMessage(model, System.currentTimeMillis())));
+                } else {
+                    sendJson(out, 502, errorJson(codeartsStreamMessage(errCode, errText, model)));
+                }
+                return;
+            }
+            // 确认是正常流：写出 200 与缓冲的内容，之后逐行透传。
+            out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                    + "Cache-Control: no-cache\r\nConnection: close\r\n\r\n")
+                    .getBytes(StandardCharsets.ISO_8859_1));
+            out.flush();
+            boolean done = false;
+            try {
+                for (String l : buffered) {
+                    String t = l.trim();
+                    if (t.startsWith("data:") && "[DONE]".equals(t.substring(5).trim())) done = true;
+                    out.write((l + "\n").getBytes(StandardCharsets.UTF_8));
+                }
+                out.flush();
+                while (!done && (line = reader.readLine()) != null) {
+                    String t = line.trim();
+                    if (t.startsWith("data:")) {
+                        String payload = t.substring(5).trim();
+                        if ("[DONE]".equals(payload)) done = true;
+                        else if (!payload.isEmpty()) {
+                            String code = CodeartsProvider.sseErrorCode(payload);
+                            if (code != null) {
+                                // 流内错误：以 OpenAI 错误事件下发后终止。
+                                // 不能静默丢弃 —— 那是「零输出卡住」的老毛病。
+                                String errText = CodeartsProvider.sseErrorText(payload);
+                                JSONObject eo = new JSONObject();
+                                eo.put("error", new JSONObject().put("message",
+                                        CodeartsProvider.isQuotaExhaustedCode(errText, payload)
+                                                ? CodeartsProvider.quotaExhaustedMessage(
+                                                        model, System.currentTimeMillis())
+                                                : codeartsStreamMessage(code, errText, model)));
+                                out.write(("data: " + eo + "\n\n").getBytes(StandardCharsets.UTF_8));
+                                out.flush();
+                                break;
+                            }
+                        }
+                    }
+                    out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+                    out.flush();
+                }
+            } finally {
+                if (!done) {
+                    out.write("data: [DONE]\n\n".getBytes(StandardCharsets.ISO_8859_1));
+                    out.flush();
+                }
+                resp.close();
+            }
+            return;
+        }
+    }
+
+    /**
+     * CodeArts 错误 → 告诉用户下一步该做什么。
+     *
+     * <p>措辞决定用户会不会做无用功：额度耗尽要让他等重置或换模型/换号，
+     * 排队要让他等（这是正常的并发限流，不是故障），凭据失效要让他重新登录。
+     * 一律说成「服务端异常请重试」会让用户对着一个必然失败的结果反复点。
+     */
+    private static String codeartsErrorMessage(CodeartsProvider.ErrorInfo info, String model) {
+        String detail = info.detail == null || info.detail.isEmpty() ? "" : "：" + info.detail;
+        if (CodeartsProvider.KIND_QUOTA.equals(info.kind)) {
+            return CodeartsProvider.quotaExhaustedMessage(model, System.currentTimeMillis()) + detail;
+        }
+        if (CodeartsProvider.KIND_QUEUE.equals(info.kind)) {
+            return "CodeArts 当前并发已满（" + model + "）" + detail
+                    + " —— 后端会排队放行，稍后重试即可；频繁重试不会加快。";
+        }
+        if (CodeartsProvider.KIND_AUTH.equals(info.kind)) {
+            return "CodeArts 凭据已失效" + detail + " —— 请到管理页重新登录 CodeArts。";
+        }
+        if (CodeartsProvider.KIND_RATE_LIMIT.equals(info.kind)) {
+            return "CodeArts 请求过于频繁（" + model + "）" + detail + " —— 请稍后重试。";
+        }
+        if (CodeartsProvider.KIND_CONTEXT_WINDOW.equals(info.kind)) {
+            return "对话超出 " + model + " 的上下文长度" + detail + " —— 请新建对话或减少内容。";
+        }
+        if (CodeartsProvider.KIND_INVALID_REQUEST.equals(info.kind)) {
+            return "CodeArts 拒绝了该请求" + detail + " —— 多为模型名或参数不被支持。";
+        }
+        if (CodeartsProvider.KIND_TRANSPORT.equals(info.kind)) {
+            return "无法连接 CodeArts" + detail + " —— 请检查网络。";
+        }
+        return "CodeArts 服务异常" + detail;
+    }
+
+    /** 流内错误码 → 用户可读文案。 */
+    private static String codeartsStreamMessage(String code, String detail, String model) {
+        String d = detail == null || detail.isEmpty() ? "" : "：" + detail;
+        if (CodeartsProvider.isQueueErrorCode(code)) {
+            return "CodeArts 当前并发已满（" + model + "）" + d
+                    + " —— 后端会排队放行，稍后重试即可。";
+        }
+        if (code != null && (code.contains("APIG.0602") || code.toLowerCase().contains("token"))) {
+            return "CodeArts 凭据已失效" + d + " —— 请到管理页重新登录 CodeArts。";
+        }
+        return "CodeArts 返回错误（" + code + "）" + d;
     }
 
     /** 取响应头首个值（HttpFetcher 的头名已由调用方保证大小写，这里再兜一层）。 */

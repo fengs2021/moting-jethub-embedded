@@ -27,3 +27,6 @@ upstream-*/
 .rebuild*.sh
 .oc*.sh
 .oc*.py
+.ca*.sh
+.ca-build/
+.ca-src/

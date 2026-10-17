@@ -34,6 +34,7 @@ public final class AccountManager {
     public static final String P_WORKBUDDY = "workbuddy";
     public static final String P_MINIMAX = "minimax";
     public static final String P_OPENCODE = "opencode";
+    public static final String P_CODEARTS = "codearts";
 
     /** 供应商元数据（顺序即界面顺序）。 */
     public static final class Meta {
@@ -61,6 +62,13 @@ public final class AccountManager {
         // 一个永远失败的签到按钮。它的登录形态也与其余五家不同：不是设备码/扫码，
         // 而是**直接填 API key**（匿名通道已被服务端封死，必须真实 key）。
         PROVIDERS.add(new Meta(P_OPENCODE, "OpenCode", "API Key", false));
+        // ⚠️ CodeArts 的签到只在**积分计费账户**上生效（Token 计费账户不在活动
+        // 范围内）。仍标 checkin=true：账户类型差异由 CreditsService 判定成
+        // inactive 并在界面如实说明，比直接不显示按钮更好 —— 用户至少知道
+        // 「这个平台有签到，只是我这类账户不参与」。
+        // 登录形态也与其余家不同：浏览器 OAuth（PKCE + DPoP，本地回调），
+        // 凭据 8 小时过期，靠 refresh_token 静默续期。
+        PROVIDERS.add(new Meta(P_CODEARTS, "CodeArts", "浏览器授权", true));
     }
 
     /** 余额/签到缓存有效期：避免每次开页面都打 5 家上游。 */
@@ -86,6 +94,8 @@ public final class AccountManager {
                 MinimaxProvider.CREDENTIAL_REF, new MinimaxIdentity()));
         buckets.put(P_OPENCODE, new AccountStore(global, "JETHUB_OPENCODE_ACCOUNTS",
                 OpencodeProvider.CREDENTIAL_REF, new OpencodeIdentity()));
+        buckets.put(P_CODEARTS, new AccountStore(global, "JETHUB_CODEARTS_ACCOUNTS",
+                CodeartsProvider.CREDENTIAL_REF, new CodeartsIdentity()));
     }
 
     public CredentialStore globalStore() { return global; }
@@ -100,6 +110,7 @@ public final class AccountManager {
         if (P_WORKBUDDY.equals(providerId)) return BuddyProvider.Variant.workbuddy().credentialRef;
         if (P_MINIMAX.equals(providerId)) return MinimaxProvider.CREDENTIAL_REF;
         if (P_OPENCODE.equals(providerId)) return OpencodeProvider.CREDENTIAL_REF;
+        if (P_CODEARTS.equals(providerId)) return CodeartsProvider.CREDENTIAL_REF;
         return null;
     }
 
@@ -172,6 +183,10 @@ public final class AccountManager {
         return new OpencodeProvider(view(P_OPENCODE, accountId));
     }
 
+    public CodeartsProvider codearts(String accountId) {
+        return new CodeartsProvider(view(P_CODEARTS, accountId));
+    }
+
     /** 按活跃账号造 Provider（聊天/列模型走它）。 */
     public Object providerFor(String providerId) {
         if (P_CLINE.equals(providerId)) return cline(null);
@@ -180,6 +195,7 @@ public final class AccountManager {
         if (P_WORKBUDDY.equals(providerId)) return workbuddy(null);
         if (P_MINIMAX.equals(providerId)) return minimax(null);
         if (P_OPENCODE.equals(providerId)) return opencode(null);
+        if (P_CODEARTS.equals(providerId)) return codearts(null);
         return null;
     }
 
@@ -321,6 +337,18 @@ public final class AccountManager {
                 if (c == null) return CreditsService.Balance.failed("凭据已失效，请重新登录").toJson();
                 return CreditsService.minimaxBalance(c.accessToken).toJson();
             }
+            if (P_CODEARTS.equals(providerId)) {
+                CodeartsProvider p = codearts(accountId);
+                if (p.loadCredential() == null) {
+                    return CreditsService.Balance.failed("未登录").toJson();
+                }
+                p.ensureFresh();
+                CodeartsProvider.Credential c = p.loadCredential();
+                if (c == null) {
+                    return CreditsService.Balance.failed("凭据已失效，请重新登录").toJson();
+                }
+                return CreditsService.codeartsBalance(c).toJson();
+            }
             return CreditsService.Balance.failed("该平台不支持余额查询").toJson();
         } catch (Exception e) {
             return CreditsService.Balance.failed(shortError(e)).toJson();
@@ -358,6 +386,14 @@ public final class AccountManager {
                 if (c == null) c = p.loadCredential();
                 if (c == null) return new CreditsService.Checkin().toJson();
                 return CreditsService.minimaxCheckinStatus(c.accessToken, timezoneId()).toJson();
+            }
+            if (P_CODEARTS.equals(providerId)) {
+                CodeartsProvider p = codearts(accountId);
+                if (p.loadCredential() == null) return new CreditsService.Checkin().toJson();
+                p.ensureFresh();
+                CodeartsProvider.Credential c = p.loadCredential();
+                if (c == null) return new CreditsService.Checkin().toJson();
+                return CreditsService.codeartsCheckinStatus(c).toJson();
             }
             return new CreditsService.Checkin().toJson();
         } catch (Exception e) {
@@ -402,6 +438,17 @@ public final class AccountManager {
                     return CreditsService.Claim.of(CreditsService.KIND_FAILED, "凭据已失效，请重新登录").toJson();
                 }
                 c = CreditsService.minimaxClaim(cr.accessToken, timezoneId());
+            } else if (P_CODEARTS.equals(providerId)) {
+                CodeartsProvider p = codearts(accountId);
+                if (p.loadCredential() == null) {
+                    return CreditsService.Claim.of(CreditsService.KIND_FAILED, "未登录").toJson();
+                }
+                p.ensureFresh();
+                CodeartsProvider.Credential cr = p.loadCredential();
+                if (cr == null) {
+                    return CreditsService.Claim.of(CreditsService.KIND_FAILED, "凭据已失效，请重新登录").toJson();
+                }
+                c = CreditsService.codeartsClaim(cr);
             } else {
                 return CreditsService.Claim.of(CreditsService.KIND_INACTIVE, "该平台没有签到活动").toJson();
             }
@@ -519,6 +566,7 @@ public final class AccountManager {
         if (P_WORKBUDDY.equals(providerId)) return workbuddy(accountId);
         if (P_MINIMAX.equals(providerId)) return minimax(accountId);
         if (P_OPENCODE.equals(providerId)) return opencode(accountId);
+        if (P_CODEARTS.equals(providerId)) return codearts(accountId);
         return null;
     }
 
@@ -530,6 +578,9 @@ public final class AccountManager {
         // OpenCode 没有续期概念（key 是长期凭据）：走到这里只是校验凭据仍可读；
         // 真正判断「key 还能不能用」由 test / credits 动作打一次上游完成。
         else if (p instanceof OpencodeProvider) ((OpencodeProvider) p).ensureFresh();
+        // CodeArts：ensureFresh 会按 expiresAt 判过期并走 DPoP 续期，
+        // refresh_token 失效时抛 RefreshTokenExpiredException（在此处冒出即为终态）。
+        else if (p instanceof CodeartsProvider) ((CodeartsProvider) p).ensureFresh();
     }
 
     /** 返回可用模型数；-1 表示失败。 */
@@ -554,6 +605,9 @@ public final class AccountManager {
             } else if (p instanceof OpencodeProvider) {
                 ((OpencodeProvider) p).ensureFresh();
                 models = ((OpencodeProvider) p).listModels();
+            } else if (p instanceof CodeartsProvider) {
+                ((CodeartsProvider) p).ensureFresh();
+                models = ((CodeartsProvider) p).listModels();
             } else {
                 return -1;
             }
@@ -751,6 +805,43 @@ public final class AccountManager {
             // key 本身是秘密，标签里只留可辨认的前后少量字符
             if (key.length() > 12) return "API Key " + key.substring(0, 6) + "…" + key.substring(key.length() - 4);
             return "API Key";
+        }
+    }
+
+    /** CodeArts 身份抽取。 */
+    static final class CodeartsIdentity implements AccountStore.Identity {
+        /**
+         * ⚠️ **绝不能用 AK / SecurityToken 当身份**。
+         *
+         * <p>CodeArts 的凭据是 STS 临时凭据：每 8 小时过期一次，每次 DPoP 续期
+         * 都会换一整套 {@code access_key_id} / {@code secret_access_key} /
+         * {@code security_token}。拿 AK 或 securityToken 做身份，每次续期都会
+         * 攒出一个「新账号」，桶里迅速堆满同一账号的历史凭据。
+         *
+         * <p>故优先用 {@code user_id}（STS 响应与 ticket 响应都给，且不随续期变），
+         * 退到 {@code domain_id}，再退到 {@code user_name}；都拿不到时退化成一个
+         * 稳定常量 —— 语义是「本机这个 CodeArts 账号」，重新登录是覆盖而非追加。
+         */
+        @Override public String identityOf(JSONObject p) {
+            String uid = p.optString("user_id", "");
+            if (!uid.isEmpty()) return "codearts:" + uid;
+            String did = p.optString("domain_id", "");
+            if (!did.isEmpty()) return "codearts:" + did;
+            String un = p.optString("user_name", "");
+            if (!un.isEmpty()) return "codearts:" + un;
+            String n = p.optString("nickname", "");
+            return n.isEmpty() ? "codearts:default" : "codearts:" + n;
+        }
+
+        @Override public String labelOf(JSONObject p) {
+            String n = p.optString("nickname", "");
+            if (!n.isEmpty()) return n;
+            String un = p.optString("user_name", "");
+            if (!un.isEmpty()) return un;
+            // AK 本身是凭据，不进标签。退到 user_id 前缀，至少能区分同机多账号。
+            String uid = p.optString("user_id", "");
+            if (!uid.isEmpty()) return "CodeArts 账号 " + (uid.length() > 8 ? uid.substring(0, 8) : uid);
+            return "CodeArts 账号";
         }
     }
 }

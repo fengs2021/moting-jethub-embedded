@@ -188,6 +188,40 @@ else
   else
     bad "找不到 OpencodeProvider.smali → opencode 平台未编进包"
   fi
+  # CodeArts 适配器：类落位 + 四个最易写错的实现点。
+  #   - signRequestHuawei：鉴权不是 Bearer 而是华为云 SDK-HMAC-SHA256，签名逻辑没了整条通道 401；
+  #   - signDpopJws：续期必须带 DPoP（ES256），缺了刷新一定失败，8 小时后凭据过期就再也接不上；
+  #   - isQueueErrorCode / isQuotaExhaustedCode：这两个判据必须分开。
+  #     额度假日码是 InferHub.4291.200，若用裸子串 429 判定会命中它的 4291 前缀，
+  #     于是把「额度已耗尽」误判成「排队」→ 每 10 秒重试、上限 30 分钟，界面零输出；
+  #   - listModels：目录合并两个端点且 benefit 标记规则特殊，写错会让模型调用失败。
+  cap="$(find "$W" -path '*jet/core/CodeartsProvider.smali' 2>/dev/null | head -1)"
+  if [ -n "$cap" ]; then
+    ca_dex="$(echo "$cap" | sed 's|.*/smali_||; s|/.*||')"
+    ok "CodeartsProvider 已打入 $ca_dex"
+    for m in signRequestHuawei signDpopJws listModels buildPayload classifyError isQueueErrorCode isQuotaExhaustedCode requestToken startLogin; do
+      grep -q "^\.method.*$m" "$cap" || bad "CodeartsProvider 缺方法：$m"
+    done
+    ca_ids="$(find "$W" -name 'AccountManager$CodeartsIdentity.smali' 2>/dev/null | head -1)"
+    if [ -n "$ca_ids" ]; then
+      ok "AccountManager 已登记 codearts 平台（含 CodeartsIdentity）"
+    else
+      bad "AccountManager 缺 CodeartsIdentity → 平台不会出现在管理页"
+    fi
+    # 身份不得取自 AK/SecurityToken：STS 临时凭据每 8 小时换一整套，
+    # 拿它做身份会每次续期攒出一个「新账号」。
+    if grep -qF 'security_token' "$ca_ids" 2>/dev/null && grep -qF 'identityOf' "$ca_ids" 2>/dev/null; then
+      bad "CodeartsIdentity 疑似拿凭据字段当身份（续期会攒出重复账号）"
+    fi
+  else
+    bad "找不到 CodeartsProvider.smali → codearts 平台未编进包"
+  fi
+  # 积分/签到：CodeArts 的余额与签到也走同一套签名，类在 CreditsService 里。
+  cs="$(find "$W" -path '*jet/core/CreditsService.smali' 2>/dev/null | head -1)"
+  if [ -n "$cs" ]; then
+    grep -q "^\.method.*codeartsClaim" "$cs" || bad "CreditsService 缺 codeartsClaim → 签到领不了"
+    grep -q "^\.method.*codeartsBalance" "$cs" || bad "CreditsService 缺 codeartsBalance"
+  fi
 fi
 
 echo
@@ -219,6 +253,13 @@ if unzip -l "$APK" | grep -q 'assets/jethub/home.html'; then
     ok "管理页含 OpenCode 卡片（API Key 表单 + 配色）"
   else
     bad "管理页缺 OpenCode 卡片 → 平台在网关里但没有入口"
+  fi
+  # CodeArts 走浏览器授权，入口是平台条目 + 配色；它的登录按钮复用通用
+  # /<provider>/login/start 路径（见 api.loginStart），故只需查条目与样式。
+  if echo "$hm" | grep -q "id: 'codearts'" && echo "$hm" | grep -q 'k-codearts'; then
+    ok "管理页含 CodeArts 卡片（浏览器授权入口 + 配色）"
+  else
+    bad "管理页缺 CodeArts 卡片 → 平台在网关里但没有入口"
   fi
 else
   bad "assets/jethub/home.html 缺失 → 管理页打不开"

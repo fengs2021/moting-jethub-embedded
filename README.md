@@ -120,7 +120,7 @@ Compose 生成的 lambda id，而不是靠行号。
 - 墨听把网关当成一个普通的 OpenAI 兼容中转：**Base URL `http://127.0.0.1:8391/v1`**，
   API Key 是管理页展示的本地密钥（运行时随机生成，非硬编码）。
 - 模型 id 形如 `cline/space-bunny-alpha`、`trae/...`、`buddy/...`、`workbuddy/...`、
-  `minimax/...`、`opencode/...`，网关按前缀路由；同一个账号下可以同时开多家。
+  `minimax/...`、`opencode/...`、`codearts/...`，网关按前缀路由；同一个账号下可以同时开多家。
 - 供应商的 token 过期由后台续期，凭据存 `CredentialStore`（App 私有目录），手机重启后依然有效。
 
 ## 当前进度
@@ -133,6 +133,7 @@ Compose 生成的 lambda id，而不是靠行号。
 | WorkBuddy | ✅ | ✅ | ✅ | ✅ 浏览器轮询 |
 | MiniMax | ✅ | ✅ | ✅ | ✅ 设备码 + PKCE |
 | OpenCode (Zen) | —（key 长期有效） | ✅ | ✅ | ✅ 填 API Key |
+| CodeArts（华为云） | ✅ DPoP 续期 | ✅ | ✅ | ✅ 浏览器授权（PKCE） |
 | Qoder | — | — | — | 需 WASM 加密绕过 |
 | DeepSeek / ZCode | — | — | — | 待移植 |
 
@@ -173,6 +174,54 @@ Compose 生成的 lambda id，而不是靠行号。
 错误分类遵循「额度语义先于鉴权」：`402` 或含 `Insufficient account funds` 归为
 **额度不足（去充值）**而不是服务端故障——归错会让用户反复重试一个永远不会成功的请求。
 `retry-after: 0` 是合法值（表示立即解除），必须与「没给这个头」区分开。
+
+### CodeArts（华为云）
+
+移植自本机 jethub 插件的 `dsh-codearts-auth`。它是标准 OpenAI 兼容端点，但**鉴权不是
+Bearer**，而是华为云 SDK-HMAC-SHA256 签名；凭据是 STS 临时凭据（AK/SK/SecurityToken），
+默认 8 小时过期，靠 DPoP 签名的 refresh_token 静默续期。
+
+登录走**浏览器授权（IAM OAuth + PKCE）**：管理页点「登录」→ 打开
+`codearts.huaweicloud.com/portal/authorize` 授权 → 回调到本机 `127.0.0.1:<端口>/oauth/callback`
+→ 换 token。旧式 ticket 流程也兼容（回调带 `secret` 参数时自动走轮询）。
+
+四个**写错就整条通道不可用**的细节：
+
+1. **`code_challenge_method` 必须是字面量 `SHA-256`**，不是 RFC 标准的 `S256`。
+   portal 以此字面量识别新式 OAuth，写错会**静默回退**旧 ticket 流程。
+2. **`Agent-Type` / `X-Language` 必须在签名之后追加**，绝不参与 canonical request 与
+   `SignedHeaders`。实测一旦进入签名，服务端回
+   `401 {"error_code":"APIG.0301","error_msg":"...verify ak sk signature fail"}`。
+3. **`max_tokens` 默认 65536**：实测 131072 反而触发空流被拒。
+4. **429 必须锚定为独立数字**（`(^|[^0-9])429([^0-9]|$)`）。额度耗尽码是
+   `InferHub.4291.200`，裸子串 `429` 会命中它的 `4291` 前缀 → 被误判成「排队」→
+   每 10 秒重试、上限 180 次（30 分钟）的静默重试，界面完全无输出。
+
+错误分类的三条不同处置（混在一起用户就会做无用功）：
+
+| 情况 | 判据 | 处置 |
+|---|---|---|
+| 排队 | `TM.00001041` / `InferHub.ModelArts.81111.429` / 独立数字 429 | 重试，10 秒一次、上限 30 分钟 |
+| 额度耗尽 | `InferHub.4291.200` 或 `insufficient quota` | **绝不重试**（按 UTC+8 自然日 24:00 重置），直接告知重置时间 |
+| benefit 缺包 | `InferHub.4004.200` | 去掉 `maas_type` 头重试**一次** |
+
+模型目录合并两个端点：benefit 模型取 opengw `gateway/config`（需 `maas_type: benefit`
+签名头），常规模型取 snap `/v1/model/builtin`。两处都**只把「归一化后未改写」的 id 记为
+benefit**——带日期后缀（`-0731`）与无后缀在后端是两个模型，benefit 属性相反，记错会让
+无后缀模型调用失败。`-NNNN` 后缀在暴露前剥掉（chat 端点只认无后缀 id），VL 视觉模型过滤掉。
+
+签到只在**积分计费账户**上生效：Token 计费账户会被判为 `inactive` 并在界面说明
+（而不是报成「领取失败」）。领取流程无幂等键，**唯一的幂等保护是领取前的活动状态预检**；
+领取响应带 `id` 时还必须补一次 confirm，漏掉会让积分停在「待确认」不入账。
+
+> **✅ 两块地基已用真实凭据实测**：华为签名（`gateway/config` 返回 200 与 4 个 benefit
+> 模型）、DPoP 续期（STS `oauth2/tokens` 返回 200 与一整套新凭据 + 新 refresh_token）。
+
+**已知差异（有意不做）**：上游适配器对 `deepseek-v4` 系模型有一套 **DSML 工具模式** ——
+不把 `tools` 发给后端，改把 schema 以文本注入 system 消息，让模型用 `<｜DSML｜tool_calls>`
+语法输出后再由客户端解析，目的是绕开 APIG 网关 ~60s 空闲断连。本项目只做透传，
+不解析模型输出，故不实现；长工具参数场景**可能**比上游更容易被网关掐断。若遇到
+`terminated` 类中断，属此已知差异而非配置错误。
 
 ### 已修复的上游缺陷
 

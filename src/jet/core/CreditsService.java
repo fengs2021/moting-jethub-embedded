@@ -923,6 +923,578 @@ public final class CreditsService {
     }
 
     // ══════════════════════════════════════════════════════════════
+    //  CodeArts —— 余额（积分包）与每日签到，全套走 SDK-HMAC-SHA256 签名
+    // ══════════════════════════════════════════════════════════════
+
+    /** snap-access 网关基址（与模型目录端点的 SNAP_MODEL_BUILTIN_URL 同域）。 */
+    public static final String CODEARTS_SNAP_ENGINE_URL =
+            "https://snap-access.cn-north-4.myhuaweicloud.com";
+    /** 账户/套餐信息端点 —— **积分账户检测的唯一真相源**。返回裸对象（无 data 信封）。 */
+    public static final String CODEARTS_PACKAGE_INFO_PATH = "/snap-manager/v1/statistics/plugin";
+    /** 活动列表端点。返回 {@code {code,message,data}} 信封。 */
+    public static final String CODEARTS_OPS_DELIVERY_PATH = "/v1/ops/delivery";
+    public static final String CODEARTS_OPS_CLAIM_PATH = "/v1/ops/claim";
+    public static final String CODEARTS_OPS_CONFIRM_PATH = "/v1/ops/confirm";
+    /** 渠道标识：声明请求来自 IDE 形态（对齐 IDE 的 channel=IDE）。 */
+    public static final String CODEARTS_OPS_CHANNEL = "IDE";
+    /** 「每日签到得积分」在活动列表里的 type 取值。 */
+    public static final String CODEARTS_DAILY_LOGIN_TYPE = "USER_LOGIN";
+
+    /**
+     * 活动 status 中表示「已领取/已确认/已核销」的取值。
+     *
+     * <p>用它将「今天已领」与「活动未开始/无资格」区分开 —— 两者对用户的
+     * 含义不同，合并成一句会让人以为签到坏了。
+     */
+    private static final String[] CODEARTS_CLAIMED_STATUSES = {"CLAIMED", "CONFIRMED", "CONSUMED"};
+
+    /**
+     * 所有 snap-access 请求共用的附加头 —— **必须在签名之后追加，不参与签名**。
+     *
+     * <p>⚠️ 这两个头绝不能作为 {@code signRequestHuawei} 的 extraSignedHeaders 传入。
+     * 实测（2026-09-18，真实凭据）：一旦 {@code Agent-Type} 进入 canonical request
+     * 与 SignedHeaders，服务端回
+     * {@code 401 {"error_code":"APIG.0301","error_msg":"...verify ak sk signature fail"}}；
+     * 同一个头在**签名之后**追加则请求成功（200 并返回真实数据）。
+     *
+     * <p>{@code Agent-Type} 本身仍是服务端路由所需（{@code /v1/model/builtin} 等
+     * 端点靠它选择响应形态），只是不该被签名。
+     */
+    public static final Map<String, String> CODEARTS_SNAP_EXTRA_HEADERS = codeartsExtraHeaders();
+
+    private static Map<String, String> codeartsExtraHeaders() {
+        Map<String, String> m = new HashMap<>();
+        m.put("Agent-Type", "PromptCenter");
+        m.put("X-Language", "zh-cn");
+        return m;
+    }
+
+    /** 积分 metric 名 → 展示名（IDE 的 accountInfoPane.apply 读这四项）。 */
+    private static final Map<String, String> CODEARTS_CREDIT_METRIC_LABELS =
+            codeartsMetricLabels();
+
+    private static Map<String, String> codeartsMetricLabels() {
+        Map<String, String> m = new HashMap<>();
+        m.put("usageTotalPackageCredit", "总积分包");
+        m.put("usageBasicPackageCredit", "基础积分包");
+        m.put("usageOnDemandPackageCredit", "按需积分包");
+        m.put("usageBonusPackageCredit", "赠送积分包");
+        return m;
+    }
+
+    /** 总额 metric 名（其余分类明细不参与总额计算，避免重复累加）。 */
+    private static final String CODEARTS_TOTAL_CREDIT_METRIC = "usageTotalPackageCredit";
+
+    /**
+     * 账户/套餐信息（{@code statistics/plugin} 的解析结果）。
+     *
+     * <p>{@code credit} 为 null 表示「这个账户没有积分口径」，与
+     * {@code total==0}（有口径但当前为 0）严格不同。
+     */
+    public static final class CodeartsAccountInfo {
+        public boolean isCreditPackage;
+        public boolean isTokenPackage;
+        public String specCode = "";
+        public String packageName = "";
+        public String packageStatus = "";
+        public Balance credit;
+
+        /**
+         * 账户类型的一句话说明（失败与「类型不符」的措辞必须分开）。
+         *
+         * <p>用户看到「Token 计费账户，不在积分活动范围」会知道自己不用折腾；
+         * 看到「账户信息查询失败」才会去查网络或重新登录。
+         */
+        public String describe() {
+            if (isCreditPackage) {
+                return packageName.isEmpty() ? "积分计费账户" : "积分计费账户 · " + packageName;
+            }
+            if (isTokenPackage) return "Token 计费账户，不在积分活动范围";
+            return "非积分计费账户，不在积分活动范围";
+        }
+    }
+
+    /** 活动列表中的一项（只保留签到所需字段）。 */
+    public static final class CodeartsActivity {
+        /**
+         * 活动 ID，领取时回传。
+         *
+         * <p>⚠️ **服务端下发的是数字**（实测 {@code campaignId = 1}），不是字符串。
+         * 用只接受字符串的解析会得到空串，领取流程据此判「缺少 campaignId」而
+         * 失败 —— 用户点了「一键领取」却看到「1 个失败」而积分实际没领到。
+         */
+        public String campaignId = "";
+        public String type = "";
+        public String title = "";
+        /** 当前是否可领取 —— 领取判定的权威依据。 */
+        public boolean claimable;
+        public String status = "";
+        /**
+         * 该活动可领积分。
+         *
+         * <p>字段名是 **{@code benefitAmount}**（实测 1000），不是 amount。
+         */
+        public double amount;
+    }
+
+    /** 查询一次的结果：ok=false 时 message 带底层原因。 */
+    public static final class CodeartsSnap {
+        public boolean ok;
+        public JSONObject data;
+        public double code;
+        public String message = "";
+    }
+
+    /**
+     * 发起一次带 SDK-HMAC-SHA256 签名的 snap-access 请求。
+     *
+     * <p>⚠️ 与模型目录的 {@code fetchSignedGet} 同款取舍：SNAP_EXTRA_HEADERS 在
+     * **签名之后**追加。把它们传进签名会进 canonical request、服务端验签失败（401）。
+     *
+     * <p>失败时带**服务端原因**而非笼统文案：华为网关的错误体里带着真正的原因，
+     * 例如 {@code {"error_code":"APIG.0301","error_msg":"...verify ak sk signature
+     * fail"}}。丢掉它会让「签名头位置不对」「凭据过期」「AK 无权限」这些**处置
+     * 方式完全不同**的问题看起来一模一样。
+     */
+    public static CodeartsSnap codeartsSignedRequest(
+            CodeartsProvider.Credential credential, String method, String url, String body) {
+        CodeartsSnap r = new CodeartsSnap();
+        if (credential == null
+                || isBlank(credential.accessKeyId) || isBlank(credential.secretAccessKey)) {
+            r.message = "凭据缺少 AK/SK";
+            return r;
+        }
+        byte[] payload = body == null ? new byte[0] : body.getBytes(StandardCharsets.UTF_8);
+        try {
+            HttpFetcher.Response resp = CodeartsProvider.signedFetch(
+                    credential, method, url, payload, null, CODEARTS_SNAP_EXTRA_HEADERS,
+                    HTTP_TIMEOUT_MS);
+            String text = resp.readText();
+            if (resp.status < 200 || resp.status >= 300) {
+                r.message = describeCodeartsHttpFailure(resp.status, text);
+                return r;
+            }
+            JSONObject raw;
+            try {
+                raw = new JSONObject(text);
+            } catch (Exception e) {
+                r.message = "响应无法解析为 JSON：" + snippet(text, 200);
+                return r;
+            }
+            return unwrapCodeartsEnvelope(raw);
+        } catch (Exception e) {
+            r.message = "网络请求失败：" + describe(e);
+            return r;
+        }
+    }
+
+    /**
+     * 把非 2xx 响应整理成**带服务端原因**的说明。
+     *
+     * <p>华为网关的错误体里有 {@code error_code}/{@code error_msg}，非 JSON 时
+     * （网关 HTML 错误页）截断原文，避免把整页 HTML 塞进界面。
+     */
+    static String describeCodeartsHttpFailure(int status, String text) {
+        String detail = "";
+        try {
+            JSONObject o = new JSONObject(text);
+            String code = o.optString("error_code", "");
+            String msg = o.optString("error_msg", "");
+            detail = code.isEmpty() ? msg : (msg.isEmpty() ? code : code + " " + msg);
+        } catch (Exception e) {
+            detail = text == null ? "" : text.trim();
+            if (detail.length() > 200) detail = detail.substring(0, 200);
+        }
+        return detail.isEmpty() ? "HTTP " + status : "HTTP " + status + "：" + detail;
+    }
+
+    /**
+     * 解包响应信封 —— **必须兼容两种形态**，因为两个端点的信封结构不同：
+     *
+     * <ul>
+     *   <li>{@code ops/*} 返回 {@code {code, message, data}}，且 {@code code !== 0}
+     *       即业务失败；</li>
+     *   <li>{@code statistics/plugin} **直接返回裸对象**，没有 data 解包步骤。</li>
+     * </ul>
+     *
+     * <p>判定顺序：先看 code（存在且非 0 即失败），再取 data，没有 data 就认为
+     * body 本身即数据。这样两种形态都能解析，且不会把业务失败当成成功 —— 那会
+     * 让「活动未开始」被误报成「领取成功」。
+     */
+    static CodeartsSnap unwrapCodeartsEnvelope(JSONObject raw) {
+        CodeartsSnap r = new CodeartsSnap();
+        Object codeVal = raw.opt("code");
+        if (codeVal instanceof Number) {
+            double code = ((Number) codeVal).doubleValue();
+            if (code != 0) {
+                String message = raw.optString("message", "");
+                if (message.isEmpty()) message = raw.optString("msg", "");
+                r.code = code;
+                r.message = message.isEmpty() ? ("业务码 " + trimNum(code)) : message;
+                return r;
+            }
+            JSONObject data = raw.optJSONObject("data");
+            if (data == null) {
+                r.code = code;
+                r.message = "响应缺少 data 字段";
+                return r;
+            }
+            r.ok = true;
+            r.data = data;
+            return r;
+        }
+        // 无 code 字段：裸对象形态（statistics/plugin）。
+        r.ok = true;
+        r.data = raw;
+        return r;
+    }
+
+    /**
+     * 查询账户/套餐信息（含积分账户检测）。
+     *
+     * <p>查询失败时 {@code ok=false} 且 message 带原因；成功但非积分账户时
+     * {@code ok=true} + {@code isCreditPackage=false}。两者必须分开：前者要用户
+     * 排查网络或重新登录，后者是正常的账户类型差异。
+     */
+    public static CodeartsSnap fetchCodeartsAccountInfo(CodeartsProvider.Credential c) {
+        return codeartsSignedRequest(c, "GET",
+                CODEARTS_SNAP_ENGINE_URL + CODEARTS_PACKAGE_INFO_PATH, null);
+    }
+
+    /** 从 {@code statistics/plugin} 的裸对象解析账户信息。 */
+    public static CodeartsAccountInfo parseCodeartsAccountInfo(JSONObject data) {
+        CodeartsAccountInfo info = new CodeartsAccountInfo();
+        JSONObject pkg = data.optJSONObject("package");
+        if (pkg == null) pkg = new JSONObject();
+        info.isCreditPackage = readBool(pkg, "is_credit_package", false);
+        info.isTokenPackage = readBool(pkg, "is_token_package", false);
+        info.specCode = pkg.optString("spec_code", "");
+        String cn = pkg.optString("package_name_cn", "");
+        String en = pkg.optString("package_name_en", "");
+        info.packageName = cn.isEmpty() ? en : cn;
+        info.packageStatus = pkg.optString("status", "");
+        info.credit = parseCodeartsCreditBalance(data.opt("metrics"));
+        return info;
+    }
+
+    /**
+     * 从 {@code metrics[]} 解析积分余额。
+     *
+     * <p>只有认得的 metric 名才参与；一项都不认得时返回 null（表示「这个账户
+     * 没有积分口径」），而不是 {@code total=0}（那是「有口径但为 0」）。
+     *
+     * <p>总额优先取 {@code usageTotalPackageCredit} 的 remain；缺失时回退为各
+     * 分项 remain 之和 —— 但**不把分项与总额同时相加**，否则会重复累加。
+     */
+    public static Balance parseCodeartsCreditBalance(Object metrics) {
+        JSONArray arr = metrics instanceof JSONArray ? (JSONArray) metrics : null;
+        if (arr == null) return null;
+        Balance b = new Balance();
+        b.unit = "credit";
+        boolean sawAny = false;
+        Double totalRemain = null;
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject item = arr.optJSONObject(i);
+            if (item == null) continue;
+            String name = item.optString("name", "");
+            String label = CODEARTS_CREDIT_METRIC_LABELS.get(name);
+            if (label == null) continue;
+            sawAny = true;
+            double amount = readNumber(item, "package_credit_amount", 0);
+            double used = readNumber(item, "package_credit_used", 0);
+            double remain = readNumber(item, "package_credit_remain", 0);
+            if (CODEARTS_TOTAL_CREDIT_METRIC.equals(name)) totalRemain = remain;
+            // 额度为 0 的分类不列为资源包：列出来只会让「N 个资源包」虚高。
+            if (amount <= 0 && remain <= 0) continue;
+            Package p = new Package();
+            p.name = label;
+            p.unit = "credit";
+            p.remaining = remain;
+            p.total = amount;
+            p.used = used;
+            // statistics/plugin 不下发资源包的有效性/周期字段（那是腾讯侧形态）。
+            // 如实置为有效、周期留空，而不是臆造一个到期时间。
+            p.active = true;
+            b.packages.add(p);
+        }
+        if (!sawAny) return null;
+        if (totalRemain != null) {
+            b.total = totalRemain.doubleValue();
+        } else {
+            double sum = 0;
+            for (Package p : b.packages) sum += p.remaining;
+            b.total = sum;
+        }
+        b.total = round(b.total);
+        return b;
+    }
+
+    /** 查询活动列表。ok=false 时带原因；ok=true 时 activities 可能为空。 */
+    public static CodeartsSnap fetchCodeartsOpsActivities(CodeartsProvider.Credential c) {
+        return codeartsSignedRequest(c, "GET",
+                CODEARTS_SNAP_ENGINE_URL + CODEARTS_OPS_DELIVERY_PATH
+                        + "?channel=" + CODEARTS_OPS_CHANNEL, null);
+    }
+
+    /** 把活动列表的一项解析为 {@link CodeartsActivity}。 */
+    public static CodeartsActivity parseCodeartsActivity(JSONObject item) {
+        CodeartsActivity a = new CodeartsActivity();
+        // 用 readIdentifier 而非 optString：实测 campaignId 是**数字** 1。
+        a.campaignId = readIdentifier(item, "campaignId");
+        a.type = item.optString("type", "");
+        a.title = item.optString("title", "");
+        a.claimable = readBool(item, "claimable", false);
+        a.status = item.optString("status", "");
+        // 实测字段名是 benefitAmount（值 1000）；另两个候选名作兼容回退。
+        double amount = readNumber(item, "benefitAmount", 0);
+        if (amount == 0) amount = readNumber(item, "amount", 0);
+        if (amount == 0) amount = readNumber(item, "creditAmount", 0);
+        a.amount = amount;
+        return a;
+    }
+
+    /** 在活动列表里找「每日签到」那一项；没有则返回 null。 */
+    public static CodeartsActivity findCodeartsDailyCheckin(List<CodeartsActivity> activities) {
+        if (activities == null) return null;
+        for (CodeartsActivity a : activities) {
+            if (CODEARTS_DAILY_LOGIN_TYPE.equals(a.type)) return a;
+        }
+        return null;
+    }
+
+    /** 读活动列表（失败返回 ok=false）。 */
+    public static CodeartsSnap readCodeartsActivities(CodeartsProvider.Credential c) {
+        CodeartsSnap r = fetchCodeartsOpsActivities(c);
+        if (!r.ok) return r;
+        Object items = r.data.opt("items");
+        JSONArray arr = items instanceof JSONArray ? (JSONArray) items : null;
+        if (arr == null) {
+            r.ok = false;
+            r.message = "响应缺少 items 字段";
+            return r;
+        }
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject item = arr.optJSONObject(i);
+            if (item != null) out.put(item);
+        }
+        JSONObject wrapped = new JSONObject();
+        try { wrapped.put("items", out); } catch (Exception ignored) { }
+        r.data = wrapped;
+        return r;
+    }
+
+    /** 余额：账户信息里的积分口径（非积分账户返回 error 说明而非 0）。 */
+    public static Balance codeartsBalance(CodeartsProvider.Credential c) {
+        CodeartsSnap r = fetchCodeartsAccountInfo(c);
+        if (!r.ok) return Balance.failed("账户信息查询失败：" + r.message);
+        CodeartsAccountInfo info = parseCodeartsAccountInfo(r.data);
+        if (info.credit == null) {
+            return Balance.failed(info.isCreditPackage
+                    ? "账户为积分计费模式，但响应没有积分口径字段"
+                    : info.describe());
+        }
+        return info.credit;
+    }
+
+    /**
+     * 签到状态：只报「能否领、今天领没领」，**不触发领取**。
+     *
+     * <p>先判账户类型（Token 计费账户不在活动范围内），再查活动列表。
+     * 两处失败都如实带原因。
+     */
+    public static Checkin codeartsCheckinStatus(CodeartsProvider.Credential c) {
+        Checkin st = new Checkin();
+        CodeartsSnap infoR = fetchCodeartsAccountInfo(c);
+        if (!infoR.ok) {
+            st.error = "账户信息查询失败：" + infoR.message;
+            return st;
+        }
+        CodeartsAccountInfo info = parseCodeartsAccountInfo(infoR.data);
+        if (!info.isCreditPackage) {
+            st.error = info.describe();
+            return st;
+        }
+        CodeartsSnap actR = readCodeartsActivities(c);
+        if (!actR.ok) {
+            st.error = "活动列表查询失败：" + actR.message;
+            return st;
+        }
+        List<CodeartsActivity> list = new ArrayList<>();
+        JSONArray items = actR.data.optJSONArray("items");
+        if (items != null) {
+            for (int i = 0; i < items.length(); i++) {
+                JSONObject item = items.optJSONObject(i);
+                if (item != null) list.add(parseCodeartsActivity(item));
+            }
+        }
+        CodeartsActivity activity = findCodeartsDailyCheckin(list);
+        if (activity == null) {
+            st.error = "未找到每日签到活动";
+            return st;
+        }
+        st.active = true;
+        st.todayCheckedIn = !activity.claimable && isCodeartsClaimedStatus(activity.status);
+        st.activityName = activity.title.isEmpty() ? "每日签到" : activity.title;
+        st.dailyCredit = activity.amount;
+        // CodeArts 的活动不下发连续签到天数概念（那是 CodeBuddy 的机制），如实记 0。
+        st.streakDays = 0;
+        return st;
+    }
+
+    /**
+     * 执行每日签到领取（完整流程）。
+     *
+     * <p>步骤与判定顺序（每一步都对应一个**对用户含义不同**的结果）：
+     * <ol>
+     *   <li>查账户类型 —— 查询失败 → failed；非积分账户 → inactive
+     *       （活动范围明确限定「已升级到积分计费模式的用户」，Token 账户不该被
+     *       报成「领取失败」）；</li>
+     *   <li>查活动列表 —— 查询失败 → failed；无 USER_LOGIN 活动 → inactive；</li>
+     *   <li>活动不可领取且状态属已领取态 → already-claimed；其余不可领取 → inactive；</li>
+     *   <li>POST {@code /v1/ops/claim} —— 失败 → failed；</li>
+     *   <li>响应 {@code id != null} 时补 POST {@code /v1/ops/confirm}
+     *       （漏掉会让积分停在待确认而不入账）；</li>
+     *   <li>成功 → claimed。</li>
+     * </ol>
+     *
+     * <p>注意第 3 步是**唯一的幂等保护**：本协议没有幂等键，也没有服务端
+     * 「今天已签到」业务码可依赖，因此预检不能省。
+     */
+    public static Claim codeartsClaim(CodeartsProvider.Credential c) {
+        CodeartsSnap infoR = fetchCodeartsAccountInfo(c);
+        if (!infoR.ok) {
+            return Claim.of(KIND_FAILED, "账户信息查询失败：" + infoR.message);
+        }
+        CodeartsAccountInfo info = parseCodeartsAccountInfo(infoR.data);
+        if (!info.isCreditPackage) return Claim.of(KIND_INACTIVE, info.describe());
+
+        CodeartsSnap actR = readCodeartsActivities(c);
+        if (!actR.ok) {
+            return Claim.of(KIND_FAILED, "活动列表查询失败：" + actR.message);
+        }
+        List<CodeartsActivity> list = new ArrayList<>();
+        JSONArray items = actR.data.optJSONArray("items");
+        if (items != null) {
+            for (int i = 0; i < items.length(); i++) {
+                JSONObject item = items.optJSONObject(i);
+                if (item != null) list.add(parseCodeartsActivity(item));
+            }
+        }
+        CodeartsActivity activity = findCodeartsDailyCheckin(list);
+        if (activity == null) return Claim.of(KIND_INACTIVE, "未找到每日签到活动");
+        if (!activity.claimable) {
+            return isCodeartsClaimedStatus(activity.status)
+                    ? Claim.of(KIND_ALREADY, "今天已领取")
+                    : Claim.of(KIND_INACTIVE, "当前不可领取（status=" + activity.status + "）");
+        }
+        if (activity.campaignId.isEmpty()) {
+            return Claim.of(KIND_FAILED, "活动缺少 campaignId，无法领取");
+        }
+
+        String claimBody;
+        try {
+            JSONObject b = new JSONObject();
+            b.put("campaignId", activity.campaignId);
+            b.put("channel", CODEARTS_OPS_CHANNEL);
+            claimBody = b.toString();
+        } catch (Exception e) {
+            return Claim.of(KIND_FAILED, "领取请求构造失败");
+        }
+        CodeartsSnap claimR = codeartsSignedRequest(c, "POST",
+                CODEARTS_SNAP_ENGINE_URL + CODEARTS_OPS_CLAIM_PATH, claimBody);
+        if (!claimR.ok) {
+            Claim out = Claim.of(KIND_FAILED, claimR.message);
+            out.code = (int) claimR.code;
+            return out;
+        }
+
+        // 服务端要求确认时才补 confirm：IDE 的判据是 benefit.id !== null。
+        // confirm 失败**不**把整体判为失败 —— 积分已进入待确认态，报 failed 会让
+        // 用户以为没领到而重复点击；这里如实返回 claimed，把确认异常留在文案层。
+        String benefitId = readIdentifier(claimR.data, "id");
+        String confirmNote = "";
+        if (!benefitId.isEmpty()) {
+            String confirmBody;
+            try {
+                JSONObject b = new JSONObject();
+                b.put("campaignId", activity.campaignId);
+                confirmBody = b.toString();
+            } catch (Exception e) {
+                confirmBody = null;
+            }
+            if (confirmBody != null) {
+                CodeartsSnap confirmR = codeartsSignedRequest(c, "POST",
+                        CODEARTS_SNAP_ENGINE_URL + CODEARTS_OPS_CONFIRM_PATH, confirmBody);
+                if (!confirmR.ok) confirmNote = "（确认未完成：" + confirmR.message + "）";
+            }
+        }
+
+        // 积分取多级回退：领取响应 → 活动条目。两处都没有时如实记 0，
+        // 不臆造「1000」—— 文档里的 1000 是活动规则，不是本次发放的实测值。
+        double claimCredit = readNumber(claimR.data, "benefitAmount", 0);
+        if (claimCredit == 0) claimCredit = readNumber(claimR.data, "credit", 0);
+        if (claimCredit == 0) claimCredit = readNumber(claimR.data, "credits", 0);
+        if (claimCredit == 0) claimCredit = readNumber(claimR.data, "creditAmount", 0);
+        if (claimCredit == 0) claimCredit = readNumber(claimR.data, "amount", 0);
+        Claim out = Claim.of(KIND_CLAIMED, confirmNote);
+        out.credit = claimCredit > 0 ? claimCredit : activity.amount;
+        // CodeArts 的活动不下发连续签到天数概念（那是 CodeBuddy 的机制），如实记 0。
+        out.streakDays = 0;
+        return out;
+    }
+
+    static boolean isCodeartsClaimedStatus(String status) {
+        if (status == null) return false;
+        for (String s : CODEARTS_CLAIMED_STATUSES) {
+            if (s.equalsIgnoreCase(status.trim())) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 读一个**标识符类**字段并统一成字符串（兼容数字与字符串两种形态）。
+     *
+     * <p>华为服务端对同一语义字段的类型并不一致 —— 实测 {@code campaignId} 下发
+     * 的是**数字** {@code 1}，而 {@code status} 下发的是字符串（不可领取时甚至为
+     * null）。用只接受字符串的读取方式会得到空串，领取流程据此判「缺少
+     * campaignId」而失败（真实缺陷：用户点「一键领取积分」后看到「1 个失败」）。
+     *
+     * <p>数字转字符串用整数形态：{@code 1} → {@code "1"}，正是回传服务端所需的
+     * 形态。对象/数组/布尔等非标量一律返回空串，避免把 {@code [object Object]}
+     * 当作 ID 发出去。
+     */
+    static String readIdentifier(JSONObject o, String key) {
+        Object v = o.opt(key);
+        if (v instanceof String) return (String) v;
+        if (v instanceof Number) {
+            double d = ((Number) v).doubleValue();
+            if (!Double.isFinite(d)) return "";
+            if (d == Math.rint(d) && Math.abs(d) < 9.007199254740992E15) {
+                return String.valueOf((long) d);
+            }
+            return trimNum(d);
+        }
+        return "";
+    }
+
+    /** 数字去尾零：1.0 → "1"，1.5 → "1.5"。 */
+    static String trimNum(double d) {
+        if (d == Math.rint(d) && Math.abs(d) < 9.007199254740992E15) return String.valueOf((long) d);
+        return String.valueOf(d);
+    }
+
+    static boolean isBlank(String s) {
+        return s == null || s.trim().isEmpty();
+    }
+
+    static String snippet(String s, int max) {
+        if (s == null) return "";
+        String t = s.trim();
+        return t.length() <= max ? t : t.substring(0, max) + "…";
+    }
+
+    // ══════════════════════════════════════════════════════════════
     //  工具
     // ══════════════════════════════════════════════════════════════
 

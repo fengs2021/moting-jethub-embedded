@@ -656,3 +656,165 @@ free_usage_limit → go_usage_limit → free_tier（不重试不换槽）
 > 故**不能用 sha256 做构建一致性判据**——判据是字节大小 + `tools/verify-apk.sh` 的结构检查。
 > 这也解释了为什么早期用 `unzip -v` 取 CRC 与 Python `zipfile`+sha256 比对会得出
 > 自相矛盾的结论（11 处差异 vs 3 处）：前者读的 `META-INF/MANIFEST.MF` 摘要本身就在变。
+
+## 里程碑 14：移植 CodeArts（华为云）平台
+
+对应需求：「把 codearts 也加进 moting-jethub。」
+
+参照物是本机 jethub 插件的 `dsh-codearts-auth`，可比对源码在 PVE
+`/root/dsh-phone/vendor/dsh-codearts-auth/src/`（127 个 `.ts`，本机副本在 `.ca-src/`）。
+
+### ① 与其余六家的本质差别：鉴权不是 Bearer，而是华为云签名
+
+前六家（Cline / Trae / Buddy / WorkBuddy / MiniMax / OpenCode）的鉴权都是
+`Authorization: Bearer <token>`；**CodeArts 是华为云 `SDK-HMAC-SHA256` 请求签名**：
+
+```
+canonicalRequest = method \n uri \n query \n headerLines \n \n signedHeaders \n sha256hex(body)
+stringToSign     = "SDK-HMAC-SHA256\n" + dateStamp + "\n" + sha256hex(canonicalRequest)
+Authorization    = SDK-HMAC-SHA256 Access=<ak>,SignedHeaders=<k1;k2;…>,Signature=<hmac-sha256(sk, stringToSign)>
+```
+
+参与签名的头固定 4 个（`host` / `x-sdk-date` / `x-sdk-content-sha256` / `x-security-token`），
+非 GET 时加 `content-type`；`uri` **不以 `/` 结尾要补一个**。
+
+因此本轮**新增了 `CodeartsProvider.signRequestHuawei` 这一整层**，其余六家都没有对应物。
+
+### ② 凭据是 STS 临时凭据，必须 DPoP 续期
+
+凭据形状是 `{access_key_id, secret_access_key, security_token, expires_at, refresh_token,
+code_verifier, dpop_private_key_jwk}` —— 有效期约 8 小时。续期不是「拿 refresh_token 换
+token」这么简单，**必须带 DPoP**：用 `dpop_private_key_jwk`（ES256/P-256）签一个 JWS
+（头部 `{alg:'ES256', typ:'dpop+jwt', jwk:<公钥>}`，载荷 `{htm, htu, iat, jti}`），
+放 `DPoP:` 头 POST 到 STS `oauth2/tokens`。
+
+Java 侧手写了两件事：ES256 签名（`SHA256withECDSA` 产出 DER，**转成 raw `r||s` 各 32 字节**
+才能拼进 JWS）与 PKCE（verifier 48 字节 base64url，challenge = sha256(verifier) base64url）。
+
+### ③ 登录：IAM OAuth + PKCE，回调服务器要 ≥10000 端口
+
+`startLogin()` 自己 bind 一个回调端口并起守护线程收 `code`。两个实测坑：
+
+- **端口必须 ≥ 10000**。`bind(0)` 拿到的随机端口常低于 10000，portal 会拒。
+  实现里从 10000 起重试 40 次。
+- **`code_challenge_method` 必须是字面量 `SHA-256`**，不是 RFC 标准的 `S256`。
+  portal 以此字面量识别新式 OAuth，写错会**静默回退**旧 ticket 流程 —— 而旧流程
+  在本场景下会一直轮询不到凭据，表现为「授权完成了但管理页一直转」。
+  授权 URL 里也**不能带** `auth_callback_url`（portal 仅凭 port 构造回调，多传视为异常）。
+
+回调同时兼容 `code`（新 OAuth）与 `secret`（旧 ticket 轮询）两种形态。
+
+### ④ 四个「写错就整条通道不可用」的细节
+
+1. **`Agent-Type` / `X-Language` 必须在签名之后追加**，绝不参与 canonical / SignedHeaders。
+   实测一旦进入签名，服务端回 `401 APIG.0301 ... verify ak sk signature fail`。
+2. **`max_tokens` 默认 65536**。实测 131072 反而触发空流被拒。
+3. **`429` 必须锚定为独立数字** `(^|[^0-9])429([^0-9]|$)`。额度耗尽码是
+   `InferHub.4291.200`，裸子串 `429` 会命中它的 `4291` 前缀。
+4. **`thinking` 是顶层字段**（`{type:'disabled'}`），不是 `extra_body.thinking` 那种方言。
+
+### ⑤ 三类错误的处置必须分开（混在一起用户就会做无用功）
+
+| 情况 | 判据 | 处置 |
+|---|---|---|
+| 排队 | `TM.00001041` / `InferHub.ModelArts.81111.429` / 独立数字 429 | 重试：10 秒一次、上限 180 次（30 分钟） |
+| 额度耗尽 | `InferHub.4291.200` 或 `insufficient quota` | **绝不重试**——按 UTC+8 自然日 24:00 结算，重试 180 次结果相同 |
+| benefit 缺包 | `InferHub.4004.200` | 去掉 `maas_type` 头重试**一次**（`benefitHeaderDropped`） |
+
+上游踩过第 3 点相关的真实坑：判据最初写裸 `/429/`，于是额度码 `InferHub.4291.200`
+被误判成「排队」→ 进入 30 分钟的静默重试循环，**界面完全零输出**（用户报障
+「CodeArts Agent 没反应」）。两条判据在实现里各是一个独立静态方法，并各有断言锁定边界。
+
+额度耗尽时写进 `modelRateLimits` 的时限是 **UTC+8 当日 24:00**（不是「8 小时后」）——
+措辞用「预计」，因为结算时刻由服务端决定。
+
+### ⑥ 积分与签到：唯一的幂等保护是预检
+
+签到只在**积分计费账户**上生效。账户类型来自 `/snap-manager/v1/statistics/plugin`
+（**裸对象，无 `data` 信封**），Token 计费账户要判成 `inactive` 并在界面说明，
+**不能报成「领取失败」**——那是两类完全不同的处置（换个账户 vs 重试）。
+
+本协议**没有幂等键，也没有服务端「今天已签到」业务码**，故唯一的幂等保护是
+领取前的活动列表预检（`claimable` + `status`）。领取成功后若响应带 `id`，
+还必须补一次 `/v1/ops/confirm` —— 漏掉会让积分停在「待确认」状态不入账。
+
+两个字段名陷阱（都会导致「点了没反应」）：
+
+- `campaignId` 服务端下发的是**数字**（实测 `1`），按字符串读会得空串 →
+  领取判「活动缺少 campaignId」失败。故用 `readIdentifier`（数字转字符串）。
+- 可领积分字段是 **`benefitAmount`**（实测 1000），不是 `amount`。
+
+### ⑦ 模型目录：benefit 标记规则特殊
+
+合并两个端点：benefit 模型取 opengw `gateway/config`（需 `maas_type: benefit` 签名头），
+常规模型取 snap `/v1/model/builtin`（需两个**不参与签名**的头）。
+
+**只把「归一化后未改写」的 id 记为 benefit** —— 带日期后缀（`deepseek-v4-flash-0731`）与
+无后缀在后端是**两个不同模型，benefit 属性相反**，记错会让无后缀模型调用失败。
+`-NNNN` 后缀在暴露前剥掉（chat 端点只认无后缀 id，否则报
+`InferHub.002002009.404 model is not registered`），VL 视觉模型过滤掉。
+
+### ⑧ 身份不能取自凭据 —— 否则每次续期攒出一个「新账号」
+
+`CodeartsIdentity.identityOf` 优先 `user_id` → `domain_id` → `user_name` → `nickname`
+→ 常量 `"codearts:default"`，**绝不用 AK / SecurityToken**。
+理由：STS 临时凭据每 8 小时换一整套（`access_key_id` 也变），拿它做身份，
+用户每续期一次管理页就多一个账号。这条与 MiniMax 那边「不能用 access_token 前缀当身份」
+是同一类错误，已在两个 Identity 的注释里互相印证。
+
+### ⑨ 地基先用真实凭据实测，再写实现
+
+在写 900 行 Java 之前先做了两个探针（`.ca-probe/`）：
+
+| 探针 | 验证 | 结果 |
+|---|---|---|
+| `sign-probe.py` | 华为签名链路 | `gateway/config` **200**，拿到 4 个 benefit 模型 |
+| `refresh-probe.py` | DPoP 续期链路 | STS `oauth2/tokens` **200**，换到新凭据 + 新 refresh_token |
+
+`sign-probe` 里 `/v1/model/builtin` 返回 401，但错误是
+`APIG.0301 ... verify ak sk signature fail` 而凭据已于当日 17:05 UTC 过期 ——
+**签名算法本身是对的**，错的是凭据时效。若不细看错误码就会误判成「签名写错了」
+而去改一个本来正确的函数。
+
+凭据来源有个格式坑：`~/.dsh/.credentials.yaml` 里该条目的值是**单引号**包裹的 JSON，
+第一版解析只处理双引号因而失败。
+
+### ⑩ 验证结果
+
+| 层 | 内容 | 结果 |
+|---|---|---|
+| 编译 | `javac`（src/jet 全量 21 个源文件） | `MAIN_OK`，exit 0 |
+| 回归 | `java RegTest` | **REG PASS**（含 15 组 CodeArts 断言） |
+| 真实端点 | `.ca-probe/` 两个探针 | 签名 200、DPoP 续期 200 |
+| 全树回编 | `bash scripts/build-full.sh` 九步 | exit 0，70619798 字节 |
+| 二进制核验 | `bash tools/verify-apk.sh` | 全绿 |
+
+15 组 CodeArts 断言覆盖：模型 id 归一化边界 / VL 过滤 / **429 锚定（4291 不得命中）** /
+额度与排队判据分离 / 错误分类顺序 / 鉴权文本 / benefit 缺包码 / SSE 内嵌错误两种形态 /
+请求体（stream · cache key · 工具流 · max_tokens · thinking）/ 会话 id 稳定性 /
+额度重置文案（按 UTC+8 自然日）/ SSE 聚合（含内嵌错误必须抛出）/ 签名 canonical 结构 /
+benefit 判定。
+
+### ⑪ 交付产物指纹
+
+| 项 | 值 |
+|---|---|
+| 文件 | `墨听-4.0.20-r2-jethub内置版.apk` |
+| 大小 | **70619798 字节**（比 OpenCode 版 +16384） |
+| dex 分包 | `classes.dex` … `classes10.dex`，编号 1..10 连续 |
+| 关键类落位 | `jet/core/CodeartsProvider.smali` + `AccountManager$CodeartsIdentity.smali` → `classes9.dex` |
+| 包身份 | `com.jethub.moting` / versionCode 40023 / versionName 4.0.20-r2 / targetSdk 34 |
+| 应用名 | 墨听JetHub |
+| 签名 | CN=JetHub Embedded, OU=Dev, O=JetHub, C=CN，SHA-256 `3f0e1b4d…5e15f73` |
+
+### ⑫ 未做的部分（有意为之）
+
+上游适配器对 `deepseek-v4` 系模型有一套 **DSML 工具模式**：不把 `tools` 发给后端，
+改为把 schema 以文本注入 system 消息，让模型用 `<｜DSML｜tool_calls>` 语法输出，
+再由客户端解析成结构化 tool-call。其目的是**绕开 APIG 网关 ~60s 空闲断连**
+（DSML 走 `delta.content`，全程有数据流）。
+
+本项目**不做**这一步：墨听的客户端只认标准 `tool_calls`，网关只做透传，
+不解析模型输出。DSML 模式需要在网关上重写 SSE 流并重新组装 tool-call 帧，
+是把「透传」变成「改写」的架构变动，收益（长工具参数场景更稳）与本轮目标
+（平台可用）不成比例。已在 README 标注为已知差异。
